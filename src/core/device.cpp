@@ -22,7 +22,6 @@ bool DeviceManager::initialize(const std::string& pjrt_plugin_path) {
 
     if (!pjrt_plugin_path.empty()) {
         std::cout << "[TPUForge] Loading hardware PJRT plugin from: " << pjrt_plugin_path << std::endl;
-        // In full deployment, dynamically loads libpjrt_tpu.so and queries device topology
         devices_.push_back(std::make_shared<Device>(0, "Google TPU v5e", 16ULL * 1024 * 1024 * 1024));
     } else {
         std::cout << "[TPUForge] No external PJRT plugin provided. Initializing local host device (CPU fallback)." << std::endl;
