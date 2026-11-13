@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -8,12 +9,18 @@ def test_core_engine_headers_and_sources_present():
     required = [
         "CMakeLists.txt",
         "include/tpuforge/pjrt_c_api.h",
+        "include/tpuforge/pjrt_driver.h",
         "include/tpuforge/device.h",
         "include/tpuforge/kv_cache.h",
+        "include/tpuforge/static_arena.h",
         "include/tpuforge/speculative.h",
+        "include/tpuforge/tree_speculator.h",
         "src/core/device.cpp",
         "src/core/kv_cache.cpp",
+        "src/core/static_arena.cpp",
         "src/speculative/verifier.cpp",
+        "src/speculative/tree_speculator.cpp",
+        "src/speculative/py_bindings.cpp",
         "src/runtime/pjrt_driver.cpp",
         "src/main.cpp",
     ]
@@ -31,6 +38,9 @@ def test_native_clang_build_and_bench_execution():
         env["PATH"] = f"{ucrt_bin};{env.get('PATH', '')}"
 
     cmake_bin = shutil.which("cmake", path=env.get("PATH")) or r"C:\msys64\ucrt64\bin\cmake.exe"
+    venv_py = root / ".venv" / "Scripts" / "python.exe"
+    py_exe = str(venv_py if venv_py.exists() else Path(sys.executable))
+
     build_dir = root / "build"
     if not (build_dir / "build.ninja").exists():
         cfg = subprocess.run(
@@ -45,6 +55,7 @@ def test_native_clang_build_and_bench_execution():
                 "-DCMAKE_C_COMPILER=clang",
                 "-DCMAKE_CXX_COMPILER=clang++",
                 "-DCMAKE_BUILD_TYPE=Release",
+                f"-DPython_EXECUTABLE={py_exe}",
             ],
             cwd=str(root),
             env=env,
@@ -75,5 +86,6 @@ def test_native_clang_build_and_bench_execution():
     )
     assert run.returncode == 0, f"Binary execution failed:\n{run.stderr}"
     assert "MXU systolic layout: 128x128" in run.stdout
-    assert "Tokens Accepted: 3" in run.stdout
+    assert "Tokens Accepted: 6" in run.stdout
+    assert "Effective Speedup: 7x" in run.stdout
     assert "Engine initialized and verified successfully." in run.stdout
