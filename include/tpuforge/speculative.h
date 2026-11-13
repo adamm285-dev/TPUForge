@@ -14,7 +14,7 @@ struct SpeculativeBatch {
 
 struct VerificationResult {
     std::vector<int32_t> accepted_tokens;
-    int32_t next_token;
+    int32_t next_token{-1};
     size_t acceptance_count{0};
     double acceptance_rate{0.0};
 };

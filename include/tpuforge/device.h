@@ -1,10 +1,11 @@
 #pragma once
 
 #include "tpuforge/pjrt_c_api.h"
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <memory>
-#include <cstdint>
 
 namespace tpuforge {
 
@@ -32,15 +33,21 @@ private:
 class DeviceManager {
 public:
     static DeviceManager& instance();
-    
-    // Discover available execution backends (TPU / CPU fallback)
+
+    // Discover host CPU device (use PjrtDriver directly for PJRT plugin initialization)
     bool initialize(const std::string& pjrt_plugin_path = "");
-    
-    const std::vector<std::shared_ptr<Device>>& devices() const { return devices_; }
+
+    std::vector<std::shared_ptr<Device>> devices() const;
     std::shared_ptr<Device> default_device();
+    bool is_initialized() const;
 
 private:
     DeviceManager() = default;
+    ~DeviceManager();
+    DeviceManager(const DeviceManager&) = delete;
+    DeviceManager& operator=(const DeviceManager&) = delete;
+
+    mutable std::mutex mu_;
     std::vector<std::shared_ptr<Device>> devices_;
     bool initialized_{false};
 };

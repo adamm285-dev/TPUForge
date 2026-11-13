@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <queue>
 #include <random>
 #include <stdexcept>
@@ -11,7 +12,11 @@ namespace tpuforge {
 
 namespace {
 
-constexpr float kMaskBlockValue = -1e30f;
+constexpr float kMaskBlockValue = -1e9f;
+
+double canonical_u01(std::mt19937_64& rng) {
+    return static_cast<double>(rng() >> 11) * 0x1.0p-53;
+}
 
 std::vector<int32_t> extract_node_path(const SystolicTree& tree, int32_t node_idx) {
     std::vector<int32_t> rev;
@@ -26,9 +31,15 @@ std::vector<int32_t> extract_node_path(const SystolicTree& tree, int32_t node_id
 }
 
 int32_t argmax_row(const float* row, size_t vocab_size) {
+    if (std::isnan(row[0])) {
+        throw std::domain_error("NaN in target logits");
+    }
     int32_t best_idx = 0;
     float best_val = row[0];
     for (size_t v = 1; v < vocab_size; ++v) {
+        if (std::isnan(row[v])) {
+            throw std::domain_error("NaN in target logits");
+        }
         if (row[v] > best_val) {
             best_val = row[v];
             best_idx = static_cast<int32_t>(v);
@@ -39,42 +50,42 @@ int32_t argmax_row(const float* row, size_t vocab_size) {
 
 void compute_softmax(const float* logits, size_t vocab_size, float temperature, std::vector<double>& out_probs) {
     out_probs.resize(vocab_size);
-    double max_val = static_cast<double>(logits[0]) / static_cast<double>(temperature);
-    for (size_t v = 1; v < vocab_size; ++v) {
-        double scaled = static_cast<double>(logits[v]) / static_cast<double>(temperature);
-        if (scaled > max_val) {
-            max_val = scaled;
+    double max_val = -std::numeric_limits<double>::infinity();
+    for (size_t v = 0; v < vocab_size; ++v) {
+        const float x = logits[v];
+        if (std::isnan(x) || x == std::numeric_limits<float>::infinity()) {
+            throw std::domain_error("NaN or +inf in target logits");
+        }
+        if (x != -std::numeric_limits<float>::infinity()) {
+            const double scaled = static_cast<double>(x) / static_cast<double>(temperature);
+            if (scaled > max_val) {
+                max_val = scaled;
+            }
         }
     }
+    if (max_val == -std::numeric_limits<double>::infinity()) {
+        throw std::domain_error("All target logits are -inf");
+    }
+
     double sum_exp = 0.0;
     for (size_t v = 0; v < vocab_size; ++v) {
-        double scaled = static_cast<double>(logits[v]) / static_cast<double>(temperature);
-        double e = std::exp(scaled - max_val);
-        out_probs[v] = e;
-        sum_exp += e;
+        const float x = logits[v];
+        if (x == -std::numeric_limits<float>::infinity()) {
+            out_probs[v] = 0.0;
+        } else {
+            const double scaled = static_cast<double>(x) / static_cast<double>(temperature);
+            const double e = std::exp(scaled - max_val);
+            out_probs[v] = e;
+            sum_exp += e;
+        }
     }
-    if (sum_exp <= 0.0) {
-        double inv = 1.0 / static_cast<double>(vocab_size);
-        std::fill(out_probs.begin(), out_probs.end(), inv);
-        return;
+    if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) {
+        throw std::domain_error("Softmax normalizer is non-finite or non-positive");
     }
-    double inv_sum = 1.0 / sum_exp;
+    const double inv_sum = 1.0 / sum_exp;
     for (size_t v = 0; v < vocab_size; ++v) {
         out_probs[v] *= inv_sum;
     }
-}
-
-int32_t sample_categorical(const std::vector<double>& probs, std::mt19937_64& rng) {
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    double u = dist(rng);
-    double cdf = 0.0;
-    for (size_t v = 0; v < probs.size(); ++v) {
-        cdf += probs[v];
-        if (u < cdf) {
-            return static_cast<int32_t>(v);
-        }
-    }
-    return static_cast<int32_t>(probs.size() - 1);
 }
 
 std::vector<TreeBuilder::BranchCandidate> query_suffix_candidates(
@@ -157,6 +168,9 @@ std::vector<TreeBuilder::BranchCandidate> query_suffix_candidates(
 } // namespace
 
 void SystolicTree::reset(int32_t root_last_token) {
+    if (root_last_token < 0) {
+        throw std::invalid_argument("SystolicTree::reset root_last_token must be non-negative");
+    }
     nodes_.clear();
     nodes_.reserve(kMaxNodes);
     TreeNode root;
@@ -171,6 +185,12 @@ void SystolicTree::reset(int32_t root_last_token) {
 int32_t SystolicTree::add_child(int32_t parent_idx, int32_t token_id, float draft_prob) {
     if (parent_idx < 0 || static_cast<size_t>(parent_idx) >= nodes_.size()) {
         throw std::out_of_range("SystolicTree::add_child parent_idx out of range");
+    }
+    if (token_id < 0) {
+        throw std::invalid_argument("SystolicTree::add_child token_id must be non-negative");
+    }
+    if (!std::isfinite(draft_prob) || draft_prob < 0.0f) {
+        throw std::invalid_argument("SystolicTree::add_child draft_prob must be finite and non-negative");
     }
 
     // Deduplicate existing child with same token_id under parent_idx.
@@ -202,6 +222,10 @@ int32_t SystolicTree::add_child(int32_t parent_idx, int32_t token_id, float draf
 PackedSystolicTile SystolicTree::pack(int32_t valid_prefix_len) const {
     if (nodes_.empty() || nodes_.size() > kMaxNodes) {
         throw std::logic_error("SystolicTree must contain between 1 and 128 nodes");
+    }
+    if (valid_prefix_len < 0 ||
+        valid_prefix_len > std::numeric_limits<int32_t>::max() - static_cast<int32_t>(kMaxNodes)) {
+        throw std::out_of_range("SystolicTree::pack valid_prefix_len out of valid int32 range");
     }
 
     constexpr size_t T = SystolicConstants::kSystolicTileSize;
@@ -355,7 +379,9 @@ TreeVerificationResult SystolicTreeVerifier::verify_greedy(
     const float* target_logits_128,
     size_t vocab_size
 ) {
-    if (!target_logits_128 || vocab_size == 0 || tree.num_nodes() == 0) {
+    if (!target_logits_128 || vocab_size == 0 ||
+        vocab_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        tree.num_nodes() == 0 || tree.num_nodes() > SystolicTree::kMaxNodes) {
         throw std::invalid_argument("Invalid arguments to SystolicTreeVerifier::verify_greedy");
     }
 
@@ -370,9 +396,12 @@ TreeVerificationResult SystolicTreeVerifier::verify_greedy(
 
         int32_t matched_child = -1;
         for (int32_t c : nodes[static_cast<size_t>(curr)].children) {
-            if (nodes[static_cast<size_t>(c)].token_id == best_tok) {
+            const int32_t c_tok = nodes[static_cast<size_t>(c)].token_id;
+            if (c_tok < 0 || static_cast<size_t>(c_tok) >= vocab_size) {
+                throw std::out_of_range("Draft child token_id out of [0, vocab_size)");
+            }
+            if (matched_child < 0 && c_tok == best_tok) {
                 matched_child = c;
-                break;
             }
         }
 
@@ -400,17 +429,21 @@ TreeVerificationResult SystolicTreeVerifier::verify_stochastic(
     float temperature,
     uint64_t seed
 ) {
-    if (!target_logits_128 || vocab_size == 0 || tree.num_nodes() == 0) {
+    if (!target_logits_128 || vocab_size == 0 ||
+        vocab_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        tree.num_nodes() == 0 || tree.num_nodes() > SystolicTree::kMaxNodes) {
         throw std::invalid_argument("Invalid arguments to SystolicTreeVerifier::verify_stochastic");
     }
-    if (temperature <= 0.0f) {
+    if (!std::isfinite(temperature)) {
+        throw std::invalid_argument("temperature must be finite");
+    }
+    if (temperature < 1e-6f) {
         return verify_greedy(tree, target_logits_128, vocab_size);
     }
 
     TreeVerificationResult result;
     const auto& nodes = tree.nodes();
     std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
 
     std::vector<double> probs;
     std::vector<double> residual;
@@ -421,6 +454,10 @@ TreeVerificationResult SystolicTreeVerifier::verify_stochastic(
         const float* row = target_logits_128 + (static_cast<size_t>(curr) * vocab_size);
         compute_softmax(row, vocab_size, temperature, probs);
         residual = probs;
+        double mass = 0.0;
+        for (double w : residual) {
+            mass += w;
+        }
 
         const auto& children = nodes[static_cast<size_t>(curr)].children;
         int32_t accepted_child = -1;
@@ -428,29 +465,24 @@ TreeVerificationResult SystolicTreeVerifier::verify_stochastic(
         for (int32_t c : children) {
             int32_t tok = nodes[static_cast<size_t>(c)].token_id;
             if (tok < 0 || static_cast<size_t>(tok) >= vocab_size) {
+                throw std::out_of_range("Draft child token_id out of [0, vocab_size)");
+            }
+            if (accepted_child >= 0) {
                 continue;
             }
             const double p_tok = residual[static_cast<size_t>(tok)];
             if (p_tok <= 0.0) {
                 continue;
             }
-            double u = uniform(rng);
-            if (u < p_tok) {
+            if (p_tok >= mass || (canonical_u01(rng) * mass) < p_tok) {
                 accepted_child = c;
-                break;
-            }
-
-            // Rejected child c: zero out its mass in residual and renormalize remaining mass.
-            double rem = 1.0 - p_tok;
-            residual[static_cast<size_t>(tok)] = 0.0;
-            if (rem > 1e-15) {
-                double inv_rem = 1.0 / rem;
-                for (size_t v = 0; v < vocab_size; ++v) {
-                    residual[v] *= inv_rem;
-                }
             } else {
-                residual = probs;
-                break;
+                // Reject child c cleanly by zeroing its unnormalized residual weight without resetting.
+                residual[static_cast<size_t>(tok)] = 0.0;
+                mass = 0.0;
+                for (double w : residual) {
+                    mass += w;
+                }
             }
         }
 
@@ -461,19 +493,29 @@ TreeVerificationResult SystolicTreeVerifier::verify_stochastic(
             result.accepted_node_indices.push_back(accepted_child);
             curr = accepted_child;
         } else {
-            double res_sum = 0.0;
-            for (double val : residual) {
-                res_sum += val;
+            if (!(mass > 0.0) || !std::isfinite(mass)) {
+                throw std::logic_error("Residual probability mass exhausted in verify_stochastic");
             }
-            if (res_sum <= 1e-15) {
-                residual = probs;
-            } else {
-                double inv = 1.0 / res_sum;
-                for (double& val : residual) {
-                    val *= inv;
+            const double target = canonical_u01(rng) * mass;
+            double cdf = 0.0;
+            int32_t bonus = -1;
+            int32_t last_nonzero = -1;
+            for (size_t v = 0; v < vocab_size; ++v) {
+                if (residual[v] > 0.0) {
+                    last_nonzero = static_cast<int32_t>(v);
+                    cdf += residual[v];
+                    if (target < cdf) {
+                        bonus = last_nonzero;
+                        break;
+                    }
                 }
             }
-            int32_t bonus = sample_categorical(residual, rng);
+            if (bonus < 0) {
+                bonus = last_nonzero;
+            }
+            if (bonus < 0) {
+                throw std::logic_error("No nonzero entry available in residual distribution");
+            }
             result.bonus_token = bonus;
             result.emitted_tokens.push_back(bonus);
             break;

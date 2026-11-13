@@ -1,16 +1,25 @@
 cmake_minimum_required(VERSION 3.20)
-project(TPUForge VERSION 0.1.0 LANGUAGES C CXX)
+project(TPUForge VERSION 0.2.0 LANGUAGES C CXX)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+option(TPUFORGE_NATIVE_ARCH "Enable -march=native optimization" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Optimization flags
+# Warning and optional target-arch flags (build optimization comes from CMAKE_BUILD_TYPE)
 if(MSVC)
-    add_compile_options(/W4 /O2 /permissive-)
+    add_compile_options(/W4 /permissive-)
 else()
-    add_compile_options(-Wall -Wextra -O3 -march=native)
+    add_compile_options(-Wall -Wextra)
+    if(TPUFORGE_NATIVE_ARCH)
+        add_compile_options(-march=native)
+    endif()
 endif()
 
 include_directories(
@@ -20,11 +29,11 @@ include_directories(
 # Core engine library
 add_library(tpuforge_core STATIC
     src/core/device.cpp
-    src/core/tensor.cpp
     src/core/kv_cache.cpp
     src/core/static_arena.cpp
     src/speculative/verifier.cpp
     src/speculative/tree_speculator.cpp
+    src/speculative/openai_server.cpp
     src/runtime/pjrt_driver.cpp
 )
 
@@ -37,6 +46,8 @@ target_include_directories(tpuforge_core PUBLIC
 
 if(UNIX)
     target_link_libraries(tpuforge_core PUBLIC ${CMAKE_DL_LIBS})
+elseif(WIN32)
+    target_link_libraries(tpuforge_core PUBLIC ws2_32)
 endif()
 
 # Command-line benchmark / runner
@@ -47,9 +58,7 @@ add_executable(tpuforge_bench
 target_link_libraries(tpuforge_bench PRIVATE tpuforge_core)
 
 if(MINGW)
-    target_link_options(tpuforge_bench PRIVATE
-        -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
-    )
+    target_link_options(tpuforge_bench PRIVATE -static)
 endif()
 
 # Test PJRT C ABI plugin shared library
@@ -61,10 +70,10 @@ set_target_properties(pjrt_test_plugin PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 if(MINGW)
-    target_link_options(pjrt_test_plugin PRIVATE -static-libgcc)
+    target_link_options(pjrt_test_plugin PRIVATE -static)
 endif()
 
-# Optional/default nanobind Python extension
+# Optional nanobind Python extension
 if(NOT DEFINED Python_EXECUTABLE)
     if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe")
         set(Python_EXECUTABLE "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe")
@@ -73,32 +82,34 @@ if(NOT DEFINED Python_EXECUTABLE)
     endif()
 endif()
 
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module QUIET)
 
-execute_process(
-    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
-    OUTPUT_VARIABLE nanobind_DIR
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE nanobind_cmake_res
-)
-
-if(nanobind_cmake_res EQUAL 0 AND EXISTS "${nanobind_DIR}")
-    list(APPEND CMAKE_PREFIX_PATH "${nanobind_DIR}")
-    find_package(nanobind CONFIG REQUIRED)
-
-    nanobind_add_module(_tpuforge_ext NB_STATIC
-        src/speculative/py_bindings.cpp
+if(Python_Interpreter_FOUND)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        OUTPUT_VARIABLE nanobind_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE nanobind_cmake_res
     )
-    target_link_libraries(_tpuforge_ext PRIVATE tpuforge_core)
-    set_target_properties(_tpuforge_ext PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    )
-    if(MINGW)
-        target_link_options(_tpuforge_ext PRIVATE
-            -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
+
+    if(nanobind_cmake_res EQUAL 0 AND EXISTS "${nanobind_DIR}")
+        list(APPEND CMAKE_PREFIX_PATH "${nanobind_DIR}")
+        find_package(nanobind CONFIG REQUIRED)
+
+        nanobind_add_module(_tpuforge_ext NB_STATIC
+            src/speculative/py_bindings.cpp
         )
+        target_link_libraries(_tpuforge_ext PRIVATE tpuforge_core)
+        set_target_properties(_tpuforge_ext PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+        )
+        if(MINGW)
+            target_link_options(_tpuforge_ext PRIVATE -static)
+        endif()
+    else()
+        message(WARNING "nanobind not found via ${Python_EXECUTABLE}; skipping _tpuforge_ext target")
     endif()
 else()
-    message(WARNING "nanobind not found via ${Python_EXECUTABLE}; skipping _tpuforge_ext target")
+    message(WARNING "Python Development.Module not found; skipping _tpuforge_ext target")
 endif()

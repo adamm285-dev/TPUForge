@@ -44,7 +44,7 @@ def test_pjrt_driver_loads_c11_plugin_and_zero_recompiles():
     assert arena.is_aligned_128() is True
 
     executor = tpu.ZeroRecompileExecutor(driver)
-    comp_ok, comp_err = executor.compile_once(cfg, "module @tpuforge_128 {}", "stablehlo")
+    comp_ok, comp_err = executor.compile_once(cfg, "module @tpuforge_128 {} // tensor<128x256xf32>", "mlir")
     assert comp_ok is True, f"compile_once failed: {comp_err}"
     assert executor.is_compiled() is True
     assert executor.compile_count() == 1
@@ -77,6 +77,8 @@ def test_pjrt_driver_loads_c11_plugin_and_zero_recompiles():
         logits = np.asarray(arena.get_logits_tile())
         assert logits.shape == (128, 256)
         assert np.isfinite(logits).all()
+        expected_row0_argmax = ((step_idx % 250) + plen + 1) % 256
+        assert int(np.argmax(logits[0])) == expected_row0_argmax
 
     driver.unload()
     assert driver.is_loaded() is False

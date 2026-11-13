@@ -1,8 +1,9 @@
 #include "tpuforge/device.h"
-#include "tpuforge/pjrt_driver.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -51,28 +52,16 @@ DeviceManager& DeviceManager::instance() {
     return instance;
 }
 
+DeviceManager::~DeviceManager() = default;
+
 bool DeviceManager::initialize(const std::string& pjrt_plugin_path) {
-    devices_.clear();
-    initialized_ = false;
+    std::scoped_lock lk(mu_);
 
     if (!pjrt_plugin_path.empty()) {
-        std::cout << "[TPUForge] Loading hardware PJRT plugin from: " << pjrt_plugin_path << std::endl;
-        PjrtDriver driver;
-        std::string err;
-        if (!driver.load_plugin(pjrt_plugin_path, &err)) {
-            std::cerr << "[TPUForge] Failed to load PJRT plugin: " << err << std::endl;
-            return false;
-        }
-        auto queried = driver.query_devices();
-        if (queried.empty()) {
-            std::cerr << "[TPUForge] PJRT plugin reported zero devices." << std::endl;
-            return false;
-        }
-        for (const auto& d : queried) {
-            devices_.push_back(std::make_shared<Device>(d.id, d.kind, d.memory_bytes));
-        }
-        initialized_ = true;
-        return true;
+        std::cerr << "[TPUForge] DeviceManager::initialize() only discovers host devices; "
+                  << "use PjrtDriver::load_plugin() for PJRT plugins (" << pjrt_plugin_path << ")."
+                  << std::endl;
+        return false;
     }
 
     unsigned int cores = std::thread::hardware_concurrency();
@@ -80,22 +69,36 @@ bool DeviceManager::initialize(const std::string& pjrt_plugin_path) {
         cores = 1;
     }
     size_t ram_bytes = query_host_physical_memory_bytes();
+    if (ram_bytes == 0) {
+        std::cerr << "[TPUForge] Warning: OS physical memory probe returned 0 bytes." << std::endl;
+    }
     std::string cpu_kind = "Host CPU (" + std::to_string(cores) + " threads)";
 
+    std::vector<std::shared_ptr<Device>> next_devices;
+    next_devices.push_back(std::make_shared<Device>(0, cpu_kind, ram_bytes));
     std::cout << "[TPUForge] Initialized local host device: " << cpu_kind << std::endl;
-    devices_.push_back(std::make_shared<Device>(0, cpu_kind, ram_bytes));
+
+    devices_ = std::move(next_devices);
     initialized_ = true;
     return true;
 }
 
+std::vector<std::shared_ptr<Device>> DeviceManager::devices() const {
+    std::scoped_lock lk(mu_);
+    return devices_;
+}
+
 std::shared_ptr<Device> DeviceManager::default_device() {
+    std::scoped_lock lk(mu_);
     if (!initialized_ || devices_.empty()) {
-        initialize();
-    }
-    if (devices_.empty()) {
-        return nullptr;
+        throw std::logic_error("DeviceManager is not initialized; call initialize() first");
     }
     return devices_.front();
+}
+
+bool DeviceManager::is_initialized() const {
+    std::scoped_lock lk(mu_);
+    return initialized_;
 }
 
 } // namespace tpuforge

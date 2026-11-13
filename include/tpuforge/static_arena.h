@@ -30,7 +30,8 @@ public:
     StaticArena& operator=(StaticArena&& other) noexcept;
 
     const Config& config() const { return config_; }
-    size_t kv_row_elems() const { return config_.num_kv_heads * config_.head_dim; }
+    // Returns elements per KV row (num_kv_heads * head_dim) with overflow protection.
+    size_t kv_row_elems() const;
 
     int32_t* token_tile_128() { return token_tile_128_; }
     const int32_t* token_tile_128() const { return token_tile_128_; }
@@ -76,5 +77,7 @@ private:
     float* logits_tile_128_{nullptr};
     int32_t valid_prefix_len_{0};
 };
+
+using StaticArenaConfig = StaticArena::Config;
 
 } // namespace tpuforge

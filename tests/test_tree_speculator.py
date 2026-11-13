@@ -208,18 +208,22 @@ def test_openxla_tree_speculation_bit_exact_and_zero_recompile():
     prompt0 = prompts[0]
     gen_len = 48
 
-    # --- 1. Ground-truth Serial Autoregressive Baseline on prompts[0] ---
-    s_kv_k = jnp.zeros((NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM), dtype=jnp.float32)
-    s_kv_v = jnp.zeros((NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM), dtype=jnp.float32)
-    for pos, tok in enumerate(prompt0):
-        s_logits, s_kv_k, s_kv_v = serial_step(params, s_kv_k, s_kv_v, tok, pos)
+    # --- 1. Ground-truth Serial Autoregressive Baselines across all 3 prompts ---
+    serial_baselines: list[list[int]] = []
+    for p_idx, prompt in enumerate(prompts):
+        target_len = gen_len if p_idx == 0 else 6
+        s_kv_k = jnp.zeros((NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM), dtype=jnp.float32)
+        s_kv_v = jnp.zeros((NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM), dtype=jnp.float32)
+        for pos, tok in enumerate(prompt):
+            s_logits, s_kv_k, s_kv_v = serial_step(params, s_kv_k, s_kv_v, tok, pos)
 
-    serial_tokens = [int(jnp.argmax(s_logits))]
-    cur_pos = len(prompt0)
-    for _ in range(gen_len - 1):
-        s_logits, s_kv_k, s_kv_v = serial_step(params, s_kv_k, s_kv_v, serial_tokens[-1], cur_pos)
-        serial_tokens.append(int(jnp.argmax(s_logits)))
-        cur_pos += 1
+        serial_tokens = [int(jnp.argmax(s_logits))]
+        cur_pos = len(prompt)
+        for _ in range(target_len - 1):
+            s_logits, s_kv_k, s_kv_v = serial_step(params, s_kv_k, s_kv_v, serial_tokens[-1], cur_pos)
+            serial_tokens.append(int(jnp.argmax(s_logits)))
+            cur_pos += 1
+        serial_baselines.append(serial_tokens)
 
     # --- 2. TPUForge 128-Node Systolic Tree Speculation across all 3 prompt lengths (9, 23, 51) ---
     # First run full 48-token decode on prompts[0] and verify bit-exact parity + speedup,
@@ -300,12 +304,24 @@ def test_openxla_tree_speculation_bit_exact_and_zero_recompile():
             generated.extend(emitted)
             history.extend(emitted)
 
+        for l_idx in range(NUM_LAYERS):
+            arena_k = np.asarray(layer_arenas[l_idx].get_kv_prefix_k_slice(0, valid_prefix_len))
+            jax_k = np.asarray(t_kv_k[l_idx, :valid_prefix_len], dtype=np.float32).reshape(
+                valid_prefix_len, NUM_HEADS * HEAD_DIM
+            )
+            np.testing.assert_allclose(arena_k, jax_k, rtol=1e-6, atol=1e-6)
+
         all_prompt_results.append((generated, passes))
 
+    for p_idx, expected_serial in enumerate(serial_baselines):
+        tree_tokens_i, _ = all_prompt_results[p_idx]
+        assert tree_tokens_i == expected_serial, (
+            f"Parity mismatch on prompt {p_idx}:\ntree:   {tree_tokens_i}\nserial: {expected_serial}"
+        )
+
     tree_tokens, tree_passes = all_prompt_results[0]
-    assert len(set(serial_tokens)) >= 6, f"Expected diverse induction sequence, got {serial_tokens}"
-    assert tree_tokens == serial_tokens, f"Parity mismatch:\ntree:   {tree_tokens}\nserial: {serial_tokens}"
-    assert tree_passes < 20, f"Expected < 20 tree forward passes for {gen_len} tokens, got {tree_passes}"
+    assert len(set(serial_baselines[0])) >= 6, f"Expected diverse induction sequence, got {serial_baselines[0]}"
+    assert tree_passes == 10, f"Expected deterministic 10 tree forward passes for {gen_len} tokens, got {tree_passes}"
     assert systolic_compile_count[0] == 1, f"Expected 1 JAX JIT compilation, got {systolic_compile_count[0]}"
 
 
@@ -316,9 +332,8 @@ def test_partial_19_node_tree_nan_immunity():
 
     # Build explicit 19-node tree
     tree = tpu.SystolicTree(root_last_token=7)
-    parent = 0
     for i in range(1, 19):
-        parent = tree.add_child(0 if i <= 6 else (i % 6), (i * 3) % VOCAB_SIZE, 0.5)
+        tree.add_child(0 if i <= 6 else (i % 6), (i * 3) % VOCAB_SIZE, 0.5)
     assert tree.num_nodes() == 19
 
     packed = tree.pack(valid_prefix_len=12)
@@ -327,6 +342,18 @@ def test_partial_19_node_tree_nan_immunity():
     # Padded diagonal rows [19..127] must have finite 0.0 on self-diagonal so softmax never yields NaN.
     for row in range(19, 128):
         assert packed["additive_mask_f32"][row, row] == 0.0
+
+    # Ancestor oracle check on active 19x19 causal mask block
+    nodes = tree.nodes()
+    for i in range(19):
+        ancestors = set()
+        cur = i
+        while cur >= 0:
+            ancestors.add(cur)
+            cur = nodes[cur].parent_idx
+        for j in range(19):
+            expected = 1 if j in ancestors else 0
+            assert int(packed["mask_u8"][i, j]) == expected
 
     kv_k = jnp.zeros((NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM), dtype=jnp.float32)
     kv_v = jnp.zeros((NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM), dtype=jnp.float32)
@@ -342,28 +369,29 @@ def test_partial_19_node_tree_nan_immunity():
     logits_19_np = np.asarray(logits_19, dtype=np.float32)
     assert np.isfinite(logits_19_np).all()
 
-    # Compare active rows [0..18] when padded tail tokens are mutated: active rows must be invariant.
+    # Compare active rows [0..18] when padded tail tokens and positions are mutated: active rows must be invariant.
     alt_tokens = np.asarray(packed["token_ids"], dtype=np.int32).copy()
     alt_tokens[19:] = 17
+    alt_positions = np.asarray(packed["position_offsets"], dtype=np.int32).copy()
+    alt_positions[19:] = 177
     logits_alt, _, _ = systolic_tree_step(
         params,
         kv_k,
         kv_v,
         jnp.int32(12),
         jnp.asarray(alt_tokens, dtype=jnp.int32),
-        jnp.asarray(packed["position_offsets"], dtype=jnp.int32),
+        jnp.asarray(alt_positions, dtype=jnp.int32),
         jnp.asarray(packed["additive_mask_f32"], dtype=jnp.float32),
     )
     np.testing.assert_allclose(logits_19_np[:19], np.asarray(logits_alt, dtype=np.float32)[:19], rtol=1e-6, atol=1e-6)
 
 
 def test_lossless_stochastic_branching_rejection_sampling():
-    """Sequential residual verification recovers exact target marginal despite distorted draft probs."""
+    """Sequential residual verification recovers exact target marginal & depth-2 joint distribution."""
     temperature = 0.9
     vocab = 16
     tree = tpu.SystolicTree(root_last_token=0)
-    # 3 distinct candidate tokens branching from root with heavily distorted draft probs q:
-    # true target wants mostly token 3 and 7, while draft guesses mostly token 1!
+    # 3 distinct candidate tokens branching from root:
     c1 = tree.add_child(0, 1, 0.85)
     c2 = tree.add_child(0, 3, 0.10)
     c3 = tree.add_child(0, 7, 0.05)
@@ -379,18 +407,60 @@ def test_lossless_stochastic_branching_rejection_sampling():
     for idx in range(1, 4):
         logits_128[idx] = rng.normal(size=(vocab,)).astype(np.float32)
 
-    # Exact target distribution p = softmax(root_logits / temperature)
-    scaled = root_logits / temperature
-    scaled = scaled - np.max(scaled)
-    target_probs = np.exp(scaled) / np.sum(np.exp(scaled))
+    def _softmax_row(row_logits: np.ndarray) -> np.ndarray:
+        scaled = row_logits / temperature
+        scaled = scaled - np.max(scaled)
+        return np.exp(scaled) / np.sum(np.exp(scaled))
+
+    target_probs = _softmax_row(root_logits)
 
     trials = 4000
     counts = np.zeros(vocab, dtype=np.float64)
+    accepts = 0
     for seed in range(1, trials + 1):
         res = tpu.SystolicTreeVerifier.verify_stochastic(tree, logits_128, temperature=temperature, seed=seed)
         first_emitted = res.emitted_tokens[0]
         counts[first_emitted] += 1.0
+        assert (res.acceptance_count >= 1) == (first_emitted in {1, 3, 7})
+        if res.acceptance_count >= 1:
+            accepts += 1
 
     empirical = counts / trials
     l1_tv = 0.5 * float(np.sum(np.abs(empirical - target_probs)))
     assert l1_tv < 0.04, f"Total variation distance {l1_tv:.4f} exceeded lossless threshold 0.04"
+
+    expected_accept_p = float(target_probs[1] + target_probs[3] + target_probs[7])
+    sigma = float(np.sqrt(expected_accept_p * (1.0 - expected_accept_p) / trials))
+    assert abs((accepts / trials) - expected_accept_p) < 3.5 * sigma
+
+    # Depth-2 joint distribution chi-square verification: root -> {0, 1}, node 0 -> {2, 3}.
+    d_vocab = 4
+    d_tree = tpu.SystolicTree(root_last_token=0)
+    na = d_tree.add_child(0, 0, 0.7)
+    nb = d_tree.add_child(0, 1, 0.3)
+    d_tree.add_child(na, 2, 0.6)
+    d_tree.add_child(na, 3, 0.4)
+    assert na == 1 and nb == 2
+
+    d_logits = np.zeros((128, d_vocab), dtype=np.float32)
+    d_logits[0] = np.array([0.8, 0.2, -0.4, -0.9], dtype=np.float32)
+    d_logits[na] = np.array([-0.5, 0.1, 1.1, 0.6], dtype=np.float32)
+    d_logits[nb] = np.array([0.3, -0.2, 0.5, 0.9], dtype=np.float32)
+
+    p_root = _softmax_row(d_logits[0])
+    p_child_a = _softmax_row(d_logits[na])
+
+    joint_trials = 20000
+    joint_counts = np.zeros((d_vocab, d_vocab), dtype=np.float64)
+    for seed in range(1, joint_trials + 1):
+        res = tpu.SystolicTreeVerifier.verify_stochastic(d_tree, d_logits, temperature=temperature, seed=seed)
+        if res.emitted_tokens[0] == 0:
+            assert len(res.emitted_tokens) >= 2
+            joint_counts[0, res.emitted_tokens[1]] += 1.0
+        else:
+            assert res.emitted_tokens[0] != 0
+
+    # Check depth-2 joint counts P(y0=0, y1=j) via Pearson chi-square (df=4, critical p<0.001 ~ 18.47)
+    expected_joint = joint_trials * p_root[0] * p_child_a
+    chi2 = float(np.sum(((joint_counts[0] - expected_joint) ** 2) / expected_joint))
+    assert chi2 < 18.5, f"Depth-2 joint chi-square {chi2:.2f} too high"
