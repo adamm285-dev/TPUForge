@@ -38,13 +38,35 @@ size_t query_host_physical_memory_bytes() {
 
 } // namespace
 
+int32_t infer_mxu_dim(const std::string& device_kind) {
+    std::string lower;
+    lower.reserve(device_kind.size());
+    for (char ch : device_kind) {
+        if (ch >= 'A' && ch <= 'Z') {
+            lower.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            lower.push_back(ch);
+        }
+    }
+    const char* patterns_256[] = {
+        "v6", "trillium", "v7", "tpu7", "ironwood", "v8", "tpu 8", "tpu8", "8i", "8t"
+    };
+    for (const char* pat : patterns_256) {
+        if (lower.find(pat) != std::string::npos) {
+            return 256;
+        }
+    }
+    return 128;
+}
+
 Device::Device(int32_t id, std::string kind, size_t memory_bytes) {
     info_.id = id;
     info_.kind = std::move(kind);
     info_.memory_bytes = memory_bytes;
     info_.is_tpu = (info_.kind.find("TPU") != std::string::npos);
-    info_.mxu_dim_x = 128;
-    info_.mxu_dim_y = 128;
+    const int32_t mxu = infer_mxu_dim(info_.kind);
+    info_.mxu_dim_x = mxu;
+    info_.mxu_dim_y = mxu;
 }
 
 DeviceManager& DeviceManager::instance() {

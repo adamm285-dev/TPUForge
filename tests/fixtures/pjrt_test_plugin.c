@@ -546,8 +546,11 @@ static PJRT_Error* test_client_compile(PJRT_Client_Compile_Args* args) {
         }
     }
 
-    if (tile_rows != 128) {
-        return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "TPU systolic compiler requires tile_rows == 128");
+    if (tile_rows != 128 && tile_rows != 256) {
+        return make_err(
+            PJRT_Error_Code_INVALID_ARGUMENT,
+            "TPU systolic compiler requires tile_rows in {128, 256}"
+        );
     }
     if (vocab_size == 0 || vocab_size > 1048576) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "Unsupported vocab_size in PJRT_Client_Compile");
@@ -685,10 +688,11 @@ static PJRT_Error* test_executable_execute(PJRT_LoadedExecutable_Execute_Args* a
     const struct PJRT_Buffer* mask_buf = in[2];
     const struct PJRT_Buffer* plen_buf = in[3];
 
-    if (tok_buf->type != PJRT_Buffer_Type_S32 || tok_buf->num_dims != 1 || tok_buf->dims[0] != 128 ||
-        pos_buf->type != PJRT_Buffer_Type_S32 || pos_buf->num_dims != 1 || pos_buf->dims[0] != 128 ||
+    const int64_t expected_rows = (int64_t)args->executable->tile_rows;
+    if (tok_buf->type != PJRT_Buffer_Type_S32 || tok_buf->num_dims != 1 || tok_buf->dims[0] != expected_rows ||
+        pos_buf->type != PJRT_Buffer_Type_S32 || pos_buf->num_dims != 1 || pos_buf->dims[0] != expected_rows ||
         mask_buf->type != PJRT_Buffer_Type_F32 || mask_buf->num_dims != 2 ||
-        mask_buf->dims[0] != 128 || mask_buf->dims[1] != 128 ||
+        mask_buf->dims[0] != expected_rows || mask_buf->dims[1] != expected_rows ||
         plen_buf->type != PJRT_Buffer_Type_S32 ||
         !(plen_buf->num_dims == 0 || (plen_buf->num_dims == 1 && plen_buf->dims[0] == 1))) {
         return make_err(PJRT_Error_Code_INVALID_ARGUMENT, "Input tensor shape or dtype mismatch");

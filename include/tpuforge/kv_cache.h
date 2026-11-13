@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace tpuforge {
@@ -42,6 +43,29 @@ private:
     size_t total_pages_{0};
     std::vector<int32_t> free_pages_;
     std::vector<uint8_t> page_in_use_;
+};
+
+struct IciRingPlan {
+    size_t ring_size{1};
+    size_t total_seq_len{0};
+    size_t chunk_seq_len{0};
+    size_t pages_per_rank{0};
+    size_t bytes_per_rank{0};
+    size_t total_cluster_bytes{0};
+    std::vector<std::pair<int32_t, int32_t>> send_perm;
+    std::vector<int32_t> chunk_start_positions;
+};
+
+class IciRingPlanner {
+public:
+    static IciRingPlan plan(const KVCacheManager::Config& kv_config, size_t ring_size);
+    static size_t source_rank_at_step(size_t dst_rank, size_t step, size_t ring_size);
+    static std::vector<uint8_t> causal_active_hops(
+        size_t query_rank,
+        size_t ring_size,
+        size_t chunk_seq_len,
+        size_t valid_seq_len
+    );
 };
 
 } // namespace tpuforge

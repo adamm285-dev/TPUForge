@@ -63,10 +63,13 @@ void StaticArena::free_aligned(void* ptr) {
 }
 
 StaticArena::StaticArena(const Config& config) : config_(config) {
-    constexpr size_t tile = SystolicConstants::kSystolicTileSize;
+    if (!SystolicConstants::is_valid_tile_size(config_.tile_size)) {
+        throw std::invalid_argument("StaticArena tile_size must be 128 or 256");
+    }
+    const size_t tile = config_.tile_size;
     if (config_.max_seq_len < tile ||
         config_.max_seq_len > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-        throw std::invalid_argument("StaticArena max_seq_len must be in [128, INT32_MAX]");
+        throw std::invalid_argument("StaticArena max_seq_len must be in [tile_size, INT32_MAX]");
     }
     if (config_.hidden_dim == 0 || config_.num_kv_heads == 0 ||
         config_.head_dim == 0 || config_.vocab_size == 0 ||
@@ -140,10 +143,9 @@ StaticArena& StaticArena::operator=(StaticArena&& other) noexcept {
 }
 
 void StaticArena::set_valid_prefix_len(int32_t len) {
-    const size_t max_allowed =
-        config_.max_seq_len - SystolicConstants::kSystolicTileSize;
+    const size_t max_allowed = config_.max_seq_len - config_.tile_size;
     if (len < 0 || static_cast<size_t>(len) > max_allowed) {
-        throw std::out_of_range("valid_prefix_len out of range [0, max_seq_len - 128]");
+        throw std::out_of_range("valid_prefix_len out of range [0, max_seq_len - tile_size]");
     }
     valid_prefix_len_ = len;
 }
@@ -163,20 +165,21 @@ void StaticArena::commit_accepted_kv_rows(
     const size_t row_bytes = row_elems * sizeof(float);
     const size_t count = accepted_row_indices.size();
 
-    if (count > SystolicConstants::kSystolicTileSize) {
-        throw std::out_of_range("accepted_row_indices size exceeds 128 systolic tile rows");
+    const size_t tile = config_.tile_size;
+    if (count > tile) {
+        throw std::out_of_range("accepted_row_indices size exceeds systolic tile rows");
     }
-    const size_t max_allowed = config_.max_seq_len - SystolicConstants::kSystolicTileSize;
+    const size_t max_allowed = config_.max_seq_len - tile;
     if (static_cast<size_t>(valid_prefix_len_) + count > max_allowed) {
-        throw std::out_of_range("StaticArena KV prefix capacity exceeded (128-token tile headroom required)");
+        throw std::out_of_range("StaticArena KV prefix capacity exceeded (tile headroom required)");
     }
 
     // Pass 1: validate all indices and reject duplicates before mutating prefix buffers.
-    std::array<bool, SystolicConstants::kSystolicTileSize> seen{};
+    std::array<bool, SystolicConstants::kMaxSystolicTileSize> seen{};
     for (size_t idx = 0; idx < count; ++idx) {
         const int32_t r = accepted_row_indices[idx];
-        if (r < 0 || static_cast<size_t>(r) >= SystolicConstants::kSystolicTileSize) {
-            throw std::out_of_range("accepted_row_indices entry out of [0, 127]");
+        if (r < 0 || static_cast<size_t>(r) >= tile) {
+            throw std::out_of_range("accepted_row_indices entry out of [0, tile_size - 1]");
         }
         if (seen[static_cast<size_t>(r)]) {
             throw std::invalid_argument("accepted_row_indices contains duplicate row index");

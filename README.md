@@ -71,10 +71,10 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 | Hardware Target | Status | Focus Area |
 | :--- | :--- | :--- |
-| **Local CPU (PJRT CPU)** | Prototyping | Architectural validation, token loops, tests |
-| **Google Colab TPU (v2/v3/v4)** | Experimental | Interactive validation, latency baselines |
-| **Cloud TPU v5e (Single-Chip)** | Target | Low-cost inference profiling (\$0.50/hr spot) |
-| **Cloud TPU v6e (Trillium)** | Production Goal | 4.7x compute density, large-scale multi-slice ICI |
+| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, OpenXLA GSPMD TP parity, 28/28 pytest |
+| **Kaggle Free TPU `v5e-8` (128 GB HBM)** | Ready | 8x16 GB pooled HBM, Megatron TP (`7B` auto, `32B` `TP=8`), streaming loader |
+| **Cloud TPU `v5e` / `v6e` (Trillium)** | Target | Auto `128x128` (v5e) or `256x256` (v6e/v7) MXU via `infer_mxu_dim` |
+| **Cloud TPU `v7` / `8x` Series** | Supported | Native `256x256` systolic tile parameterization |
 
 ---
 
@@ -82,19 +82,32 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 ### Local Build & Test
 ```bash
-# Configure and compile with CMake
-cmake -B build -S .
-cmake --build build --config Release
+# Configure and compile with CMake + Ninja
+cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 
-# Run test suite
-./build/tpuforge_tests
+# Verify native 128-row and 256-row systolic paths
+./build/tpuforge_bench --tile-size 128
+./build/tpuforge_bench --tile-size 256
+pytest -q
 ```
 
-### Running on TPU via PJRT
+### Real-Weight Qwen2.5-Coder Benchmark, ICI Ring-Attention (`M-005`), & Kaggle `v5e-8` Bundle
+```bash
+# Run Vanilla JAX vs StaticArena (M-002) vs TPUForge Tree (M-003)
+python -m benchmarks.run_qwen_bench --model Qwen/Qwen2.5-Coder-0.5B-Instruct --tile-size auto --tp-size auto
+
+# Run M-005 Optical Torus Ring-Attention (ppermute prefill + stationary-KV systolic tree decode via IciRingPlanner)
+python -m benchmarks.ring_attention_jax --max-seq-len 8192 --valid-seq-len 6144 --ring-size auto --tp-size 1
+
+# Build standalone source zip for Kaggle / Colab TPU upload
+python -m benchmarks.package_kaggle_bundle
+```
+
+### Running Native CLI on TPU via PJRT
 Set the environment variable pointing to the TPU PJRT plugin:
 ```bash
-export PJRT_PLUGIN_PATH=/path/to/libpjrt_tpu.so
-./build/tpuforge_bench --model gemma-2b
+./build/tpuforge_bench --plugin /path/to/libpjrt_tpu.so --program model.mlir --tile-size 256
 ```
 
 ---

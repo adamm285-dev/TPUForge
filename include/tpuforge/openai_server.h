@@ -73,6 +73,7 @@ private:
 struct GenerationRequest {
     std::vector<ChatMessage> messages;
     std::vector<int32_t> prompt_tokens;
+    std::vector<int32_t> eos_token_ids;
     size_t max_tokens{64};
     float temperature{0.0f};
     std::optional<uint64_t> seed;

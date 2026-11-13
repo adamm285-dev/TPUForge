@@ -167,12 +167,18 @@ std::vector<TreeBuilder::BranchCandidate> query_suffix_candidates(
 
 } // namespace
 
-void SystolicTree::reset(int32_t root_last_token) {
+void SystolicTree::reset(int32_t root_last_token, size_t tile_size) {
     if (root_last_token < 0) {
         throw std::invalid_argument("SystolicTree::reset root_last_token must be non-negative");
     }
+    if (tile_size != 0) {
+        if (!SystolicConstants::is_valid_tile_size(tile_size)) {
+            throw std::invalid_argument("SystolicTree tile_size must be 128 or 256");
+        }
+        tile_size_ = tile_size;
+    }
     nodes_.clear();
-    nodes_.reserve(kMaxNodes);
+    nodes_.reserve(tile_size_);
     TreeNode root;
     root.token_id = root_last_token;
     root.parent_idx = -1;
@@ -200,7 +206,7 @@ int32_t SystolicTree::add_child(int32_t parent_idx, int32_t token_id, float draf
         }
     }
 
-    if (nodes_.size() >= kMaxNodes) {
+    if (nodes_.size() >= tile_size_) {
         return -1;
     }
 
@@ -220,21 +226,22 @@ int32_t SystolicTree::add_child(int32_t parent_idx, int32_t token_id, float draf
 }
 
 PackedSystolicTile SystolicTree::pack(int32_t valid_prefix_len) const {
-    if (nodes_.empty() || nodes_.size() > kMaxNodes) {
-        throw std::logic_error("SystolicTree must contain between 1 and 128 nodes");
+    const size_t T = tile_size_;
+    if (nodes_.empty() || nodes_.size() > T) {
+        throw std::logic_error("SystolicTree must contain between 1 and tile_size nodes");
     }
     if (valid_prefix_len < 0 ||
-        valid_prefix_len > std::numeric_limits<int32_t>::max() - static_cast<int32_t>(kMaxNodes)) {
+        valid_prefix_len > std::numeric_limits<int32_t>::max() - static_cast<int32_t>(T)) {
         throw std::out_of_range("SystolicTree::pack valid_prefix_len out of valid int32 range");
     }
 
-    constexpr size_t T = SystolicConstants::kSystolicTileSize;
     PackedSystolicTile tile;
+    tile.tile_size = T;
     tile.active_nodes = nodes_.size();
-    tile.token_ids.fill(0);
-    tile.position_offsets.fill(0);
-    tile.mask_u8.fill(0);
-    tile.additive_mask_f32.fill(kMaskBlockValue);
+    tile.token_ids.assign(T, 0);
+    tile.position_offsets.assign(T, 0);
+    tile.mask_u8.assign(T * T, 0);
+    tile.additive_mask_f32.assign(T * T, kMaskBlockValue);
 
     const size_t n = nodes_.size();
     for (size_t i = 0; i < n; ++i) {
@@ -251,7 +258,7 @@ PackedSystolicTile SystolicTree::pack(int32_t valid_prefix_len) const {
         }
     }
 
-    // Padded rows [n .. 127] attend strictly to themselves so softmax stays finite.
+    // Padded rows [n .. T - 1] attend strictly to themselves so softmax stays finite.
     for (size_t i = n; i < T; ++i) {
         tile.mask_u8[i * T + i] = 1;
         tile.additive_mask_f32[i * T + i] = 0.0f;
@@ -263,14 +270,23 @@ PackedSystolicTile SystolicTree::pack(int32_t valid_prefix_len) const {
 SystolicTree SuffixTreeDrafter::build_tree(
     const std::vector<int32_t>& context_tokens,
     size_t max_nodes,
-    size_t max_depth
+    size_t max_depth,
+    size_t tile_size
 ) {
     if (context_tokens.empty()) {
         throw std::invalid_argument("SuffixTreeDrafter requires non-empty context_tokens");
     }
-    const size_t clamped_nodes = std::clamp<size_t>(max_nodes, 1, SystolicTree::kMaxNodes);
+    const size_t resolved_tile = (tile_size == 0)
+        ? (max_nodes > SystolicTree::kMaxNodes
+               ? SystolicConstants::kSystolicTileSizeV6
+               : SystolicConstants::kSystolicTileSize)
+        : tile_size;
+    if (!SystolicConstants::is_valid_tile_size(resolved_tile)) {
+        throw std::invalid_argument("SuffixTreeDrafter tile_size must be 128 or 256");
+    }
+    const size_t clamped_nodes = std::clamp<size_t>(max_nodes, 1, resolved_tile);
 
-    SystolicTree tree(context_tokens.back());
+    SystolicTree tree(context_tokens.back(), resolved_tile);
     if (clamped_nodes == 1 || max_depth == 0) {
         return tree;
     }
@@ -326,10 +342,19 @@ SystolicTree TreeBuilder::build_from_branching_callback(
     int32_t root_last_token,
     const BranchCallback& callback,
     size_t max_nodes,
-    size_t max_depth
+    size_t max_depth,
+    size_t tile_size
 ) {
-    const size_t clamped_nodes = std::clamp<size_t>(max_nodes, 1, SystolicTree::kMaxNodes);
-    SystolicTree tree(root_last_token);
+    const size_t resolved_tile = (tile_size == 0)
+        ? (max_nodes > SystolicTree::kMaxNodes
+               ? SystolicConstants::kSystolicTileSizeV6
+               : SystolicConstants::kSystolicTileSize)
+        : tile_size;
+    if (!SystolicConstants::is_valid_tile_size(resolved_tile)) {
+        throw std::invalid_argument("TreeBuilder tile_size must be 128 or 256");
+    }
+    const size_t clamped_nodes = std::clamp<size_t>(max_nodes, 1, resolved_tile);
+    SystolicTree tree(root_last_token, resolved_tile);
     if (clamped_nodes == 1 || max_depth == 0 || !callback) {
         return tree;
     }
@@ -381,7 +406,7 @@ TreeVerificationResult SystolicTreeVerifier::verify_greedy(
 ) {
     if (!target_logits_128 || vocab_size == 0 ||
         vocab_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
-        tree.num_nodes() == 0 || tree.num_nodes() > SystolicTree::kMaxNodes) {
+        tree.num_nodes() == 0 || tree.num_nodes() > tree.tile_size()) {
         throw std::invalid_argument("Invalid arguments to SystolicTreeVerifier::verify_greedy");
     }
 
@@ -431,7 +456,7 @@ TreeVerificationResult SystolicTreeVerifier::verify_stochastic(
 ) {
     if (!target_logits_128 || vocab_size == 0 ||
         vocab_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
-        tree.num_nodes() == 0 || tree.num_nodes() > SystolicTree::kMaxNodes) {
+        tree.num_nodes() == 0 || tree.num_nodes() > tree.tile_size()) {
         throw std::invalid_argument("Invalid arguments to SystolicTreeVerifier::verify_stochastic");
     }
     if (!std::isfinite(temperature)) {

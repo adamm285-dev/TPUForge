@@ -30,8 +30,8 @@ def test_pjrt_driver_loads_c11_plugin_and_zero_recompiles():
     assert len(devices) == 2
     assert devices[0].kind == "Google TPU v6e"
     assert devices[0].is_tpu is True
-    assert devices[0].mxu_dim_x == 128
-    assert devices[0].mxu_dim_y == 128
+    assert devices[0].mxu_dim_x == 256
+    assert devices[0].mxu_dim_y == 256
     assert devices[0].memory_bytes == 32 * 1024 * 1024 * 1024
 
     cfg = tpu.StaticArenaConfig()
@@ -115,3 +115,64 @@ def test_static_arena_alignment_and_kv_row_compaction():
     # Attempting to overflow max_seq_len - 128 headroom raises IndexError cleanly.
     with pytest.raises(IndexError):
         arena.set_valid_prefix_len(254)
+
+
+def test_infer_mxu_dim_generations():
+    for v5_like in ("Google TPU v5e", "TPU v5p", "TPU v4", "Host CPU (16 threads)"):
+        assert tpu.infer_mxu_dim(v5_like) == 128
+    for v6_plus in ("Google TPU v6e", "TPU Trillium", "TPU v7", "TPU Ironwood", "TPU 8t", "TPU8i"):
+        assert tpu.infer_mxu_dim(v6_plus) == 256
+
+
+def test_static_arena_and_pjrt_tile_256_zero_recompile():
+    plugin_path = find_pjrt_test_plugin()
+    driver = tpu.PjrtDriver()
+    ok, err = driver.load_plugin(str(plugin_path))
+    assert ok is True, f"Failed to load PJRT plugin: {err}"
+
+    cfg = tpu.StaticArenaConfig()
+    cfg.tile_size = 256
+    cfg.max_seq_len = 8192
+    cfg.hidden_dim = 128
+    cfg.num_kv_heads = 4
+    cfg.head_dim = 32
+    cfg.vocab_size = 256
+    arena = tpu.StaticArena(cfg)
+    assert arena.tile_size() == 256
+    assert arena.is_aligned_128() is True
+
+    executor = tpu.ZeroRecompileExecutor(driver)
+    comp_ok, comp_err = executor.compile_once(cfg, "module @tpuforge_256 {} // tensor<256x256xf32>", "mlir")
+    assert comp_ok is True, f"compile_once(256) failed: {comp_err}"
+    assert executor.compile_count() == 1
+
+    # Verify a 200-node tree exceeds the legacy 128 limit and packs cleanly into 256x256.
+    tree = tpu.SystolicTree(7, tile_size=256)
+    assert tree.tile_size() == 256
+    for i in range(1, 200):
+        idx = tree.add_child(0, (i + 10) % 250, 0.9)
+        assert idx == i
+    assert tree.num_nodes() == 200
+
+    for step_idx, plen in enumerate([1, 128, 256, 2048], start=1):
+        arena.set_valid_prefix_len(plen)
+        packed = tree.pack(plen)
+        assert packed["tile_size"] == 256
+        assert packed["token_ids"].shape == (256,)
+        assert packed["additive_mask_f32"].shape == (256, 256)
+        arena.set_tile_inputs(
+            packed["token_ids"],
+            packed["position_offsets"],
+            packed["additive_mask_f32"],
+        )
+        step_ok, step_err = executor.execute_step(arena)
+        assert step_ok is True, f"execute_step(256) failed at prefix={plen}: {step_err}"
+        assert executor.compile_count() == 1
+        assert executor.execute_count() == step_idx
+
+        logits = np.asarray(arena.get_logits_tile())
+        assert logits.shape == (256, 256)
+        assert np.isfinite(logits).all()
+        assert int(np.argmax(logits[0])) == (7 + plen + 1) % 256
+
+    driver.unload()

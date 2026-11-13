@@ -710,8 +710,9 @@ bool PjrtDriver::load_plugin(const std::string& library_path, std::string* error
             }
         }
         info.is_tpu = (info.kind.find("TPU") != std::string::npos);
-        info.mxu_dim_x = 128;
-        info.mxu_dim_y = 128;
+        const int32_t mxu = infer_mxu_dim(info.kind);
+        info.mxu_dim_x = mxu;
+        info.mxu_dim_y = mxu;
         next_devices.push_back(std::move(info));
     }
 
@@ -862,8 +863,9 @@ bool ZeroRecompileExecutor::compile_once(
     const std::string& format,
     std::string* error_out
 ) {
-    if (config.vocab_size == 0 || config.max_seq_len < SystolicConstants::kSystolicTileSize ||
-        (config.max_seq_len % SystolicConstants::kSystolicTileSize) != 0 ||
+    if (!SystolicConstants::is_valid_tile_size(config.tile_size) ||
+        config.vocab_size == 0 || config.max_seq_len < config.tile_size ||
+        (config.max_seq_len % config.tile_size) != 0 ||
         config.hidden_dim == 0 || config.num_kv_heads == 0 || config.head_dim == 0) {
         if (error_out) {
             *error_out = "Invalid StaticArenaConfig dimensions for systolic compilation";
@@ -891,7 +893,7 @@ bool ZeroRecompileExecutor::compile_once(
     std::string effective_format = (format == "stablehlo") ? std::string("mlir") : format;
 
     StaticShapeKey next_key{
-        SystolicConstants::kSystolicTileSize,
+        config.tile_size,
         config.max_seq_len,
         config.hidden_dim,
         config.num_kv_heads,
@@ -1033,9 +1035,10 @@ bool ZeroRecompileExecutor::execute_step_impl(
     size_t tile_rows,
     std::string* error_out
 ) {
-    if (tile_rows != SystolicConstants::kSystolicTileSize) {
+    const size_t effective_rows = (tile_rows == 0) ? arena.tile_size() : tile_rows;
+    if (!SystolicConstants::is_valid_tile_size(effective_rows)) {
         throw std::invalid_argument(
-            "Systolic array execution requires static tile_rows == 128 to prevent XLA recompilation"
+            "Systolic array execution requires static tile_rows in {128, 256} to prevent XLA recompilation"
         );
     }
 
@@ -1073,15 +1076,17 @@ bool ZeroRecompileExecutor::execute_step_impl(
     }
 
     const StaticArenaConfig& cfg = arena.config();
-    if (!arena.token_tile_128() || !arena.position_tile_128() ||
-        !arena.causal_mask_128x128() || !arena.logits_tile_128() ||
+    if (!arena.token_tile() || !arena.position_tile() ||
+        !arena.causal_mask() || !arena.logits_tile() ||
         (use_stateful_kv && (!arena.kv_prefix_k() || !arena.kv_prefix_v()))) {
         if (error_out) {
             *error_out = "StaticArena has been moved from";
         }
         return false;
     }
-    if (cfg.max_seq_len != shape_key_.max_seq_len ||
+    if (cfg.tile_size != shape_key_.tile_rows ||
+        effective_rows != shape_key_.tile_rows ||
+        cfg.max_seq_len != shape_key_.max_seq_len ||
         cfg.hidden_dim != shape_key_.hidden_dim ||
         cfg.num_kv_heads != shape_key_.num_kv_heads ||
         cfg.head_dim != shape_key_.head_dim ||
@@ -1115,21 +1120,21 @@ bool ZeroRecompileExecutor::execute_step_impl(
         in_guards.emplace_back(api, nullptr);
     }
 
-    const int64_t dims_1d[1] = {static_cast<int64_t>(tile_rows)};
+    const int64_t dims_1d[1] = {static_cast<int64_t>(effective_rows)};
     const int64_t dims_mask[2] = {
-        static_cast<int64_t>(tile_rows),
-        static_cast<int64_t>(tile_rows),
+        static_cast<int64_t>(effective_rows),
+        static_cast<int64_t>(effective_rows),
     };
     const int32_t plen_val = arena.valid_prefix_len();
 
     if (!upload_host_buffer(
-            api, client, target_device, arena.token_tile_128(), PJRT_Buffer_Type_S32,
+            api, client, target_device, arena.token_tile(), PJRT_Buffer_Type_S32,
             dims_1d, 1, &in_guards[0].buf, error_out) ||
         !upload_host_buffer(
-            api, client, target_device, arena.position_tile_128(), PJRT_Buffer_Type_S32,
+            api, client, target_device, arena.position_tile(), PJRT_Buffer_Type_S32,
             dims_1d, 1, &in_guards[1].buf, error_out) ||
         !upload_host_buffer(
-            api, client, target_device, arena.causal_mask_128x128(), PJRT_Buffer_Type_F32,
+            api, client, target_device, arena.causal_mask(), PJRT_Buffer_Type_F32,
             dims_mask, 2, &in_guards[2].buf, error_out) ||
         !upload_host_buffer(
             api, client, target_device, &plen_val, PJRT_Buffer_Type_S32,
@@ -1196,24 +1201,24 @@ bool ZeroRecompileExecutor::execute_step_impl(
     }
 
     if (!download_f32_2d_buffer(
-            api, out_ptrs[0], tile_rows, cfg.vocab_size, arena.logits_tile_128(), "logits", error_out)) {
+            api, out_ptrs[0], effective_rows, cfg.vocab_size, arena.logits_tile(), "logits", error_out)) {
         return false;
     }
 
     if (use_stateful_kv && (out_step_k || out_step_v)) {
         const size_t kv_elems = arena.kv_row_elems();
-        const size_t step_elems = tile_rows * kv_elems;
+        const size_t step_elems = effective_rows * kv_elems;
         if (out_step_k) {
             out_step_k->resize(step_elems);
             if (!download_f32_2d_buffer(
-                    api, out_ptrs[1], tile_rows, kv_elems, out_step_k->data(), "step_k", error_out)) {
+                    api, out_ptrs[1], effective_rows, kv_elems, out_step_k->data(), "step_k", error_out)) {
                 return false;
             }
         }
         if (out_step_v) {
             out_step_v->resize(step_elems);
             if (!download_f32_2d_buffer(
-                    api, out_ptrs[2], tile_rows, kv_elems, out_step_v->data(), "step_v", error_out)) {
+                    api, out_ptrs[2], effective_rows, kv_elems, out_step_v->data(), "step_v", error_out)) {
                 return false;
             }
         }

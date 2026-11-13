@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
     bool serve_mode = false;
     std::string bind_host = "127.0.0.1";
     uint16_t bind_port = 8080;
+    size_t cli_tile_size = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -103,6 +104,20 @@ int main(int argc, char** argv) {
                 return 1;
             }
             program_format = argv[++i];
+        } else if (arg == "--tile-size") {
+            if (i + 1 >= argc) {
+                std::cerr << "[CLI] Missing value after --tile-size" << std::endl;
+                return 1;
+            }
+            const std::string tile_str = argv[++i];
+            if (tile_str == "128") {
+                cli_tile_size = 128;
+            } else if (tile_str == "256") {
+                cli_tile_size = 256;
+            } else {
+                std::cerr << "[CLI] Invalid --tile-size (expected 128 or 256)" << std::endl;
+                return 1;
+            }
         } else if (arg == "--serve") {
             serve_mode = true;
         } else if (arg == "--host") {
@@ -180,17 +195,34 @@ int main(int argc, char** argv) {
               << " | MXU systolic layout: " << device->info().mxu_dim_x
               << "x" << device->info().mxu_dim_y << std::endl;
 
+    size_t inferred_tile = static_cast<size_t>(device->info().mxu_dim_x);
+    if (!program_code.empty()) {
+        if (program_code.find("tensor<256x") != std::string::npos) {
+            inferred_tile = 256;
+        } else if (program_code.find("tensor<128x") != std::string::npos) {
+            inferred_tile = 128;
+        }
+    }
+
     tpuforge::StaticArena::Config arena_cfg;
     arena_cfg.max_seq_len = 8192;
     arena_cfg.hidden_dim = 128;
     arena_cfg.num_kv_heads = 8;
     arena_cfg.head_dim = 128;
     arena_cfg.vocab_size = 32000;
+    arena_cfg.tile_size = (cli_tile_size != 0) ? cli_tile_size : inferred_tile;
+
+    std::cout << "[Main] Systolic tile width: " << arena_cfg.tile_size
+              << "x" << arena_cfg.tile_size << std::endl;
 
     if (serve_mode) {
         try {
             tpuforge::ForgeEngine engine(
-                *plugin_driver, arena_cfg, program_code, program_format, "tpuforge-systolic-128"
+                *plugin_driver,
+                arena_cfg,
+                program_code,
+                program_format,
+                "tpuforge-systolic-" + std::to_string(arena_cfg.tile_size)
             );
             tpuforge::OpenAIServer::Config srv_cfg;
             srv_cfg.host = bind_host;
@@ -235,7 +267,7 @@ int main(int argc, char** argv) {
         const int32_t test_prefixes[] = {16, 129, 1024, 4096};
         for (int32_t prefix : test_prefixes) {
             arena.set_valid_prefix_len(prefix);
-            if (!exec->execute_step(arena, tpuforge::SystolicConstants::kSystolicTileSize, &err)) {
+            if (!exec->execute_step(arena, arena_cfg.tile_size, &err)) {
                 std::cerr << "[PJRT] Execute failed: " << err << std::endl;
                 return 1;
             }
@@ -272,19 +304,19 @@ int main(int argc, char** argv) {
     context_tokens.push_back(2054);
     context_tokens.push_back(2003);
 
+    const size_t T = arena_cfg.tile_size;
     auto t0 = std::chrono::steady_clock::now();
-    tpuforge::SystolicTree tree = tpuforge::SuffixTreeDrafter::build_tree(context_tokens, 128, 16);
+    tpuforge::SystolicTree tree = tpuforge::SuffixTreeDrafter::build_tree(context_tokens, T, 16, T);
     auto packed = tree.pack(128);
     auto t1 = std::chrono::steady_clock::now();
     double draft_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
 
     const size_t vocab_size = arena_cfg.vocab_size;
     if (exec) {
-        constexpr size_t T = tpuforge::SystolicConstants::kSystolicTileSize;
         arena.set_valid_prefix_len(128);
-        std::memcpy(arena.token_tile_128(), packed.token_ids.data(), T * sizeof(int32_t));
-        std::memcpy(arena.position_tile_128(), packed.position_offsets.data(), T * sizeof(int32_t));
-        std::memcpy(arena.causal_mask_128x128(), packed.additive_mask_f32.data(), T * T * sizeof(float));
+        std::memcpy(arena.token_tile(), packed.token_ids.data(), T * sizeof(int32_t));
+        std::memcpy(arena.position_tile(), packed.position_offsets.data(), T * sizeof(int32_t));
+        std::memcpy(arena.causal_mask(), packed.additive_mask_f32.data(), T * T * sizeof(float));
 
         std::string err;
         if (!exec->execute_step(arena, T, &err)) {
@@ -292,17 +324,18 @@ int main(int argc, char** argv) {
             return 1;
         }
         auto verify_res = tpuforge::SystolicTreeVerifier::verify_greedy(
-            tree, arena.logits_tile_128(), vocab_size
+            tree, arena.logits_tile(), vocab_size
         );
         std::cout << "\n[Systolic Tree PJRT Execution Results]" << std::endl;
-        std::cout << "Nodes Packed: " << packed.active_nodes << " / 128 (Draft + Pack: " << draft_us << " us)" << std::endl;
+        std::cout << "Nodes Packed: " << packed.active_nodes << " / " << T
+                  << " (Draft + Pack: " << draft_us << " us)" << std::endl;
         std::cout << "Tokens Accepted: " << verify_res.acceptance_count << std::endl;
         std::cout << "Bonus/Correction Token: " << verify_res.bonus_token << std::endl;
         std::cout << "Total Tokens Emitted: " << verify_res.emitted_tokens.size() << std::endl;
     } else {
         // Host self-test without PJRT plugin: exercise verifier against deterministic synthetic oracle logits.
-        float* ref_logits = arena.logits_tile_128();
-        std::memset(ref_logits, 0, tpuforge::SystolicConstants::kSystolicTileSize * vocab_size * sizeof(float));
+        float* ref_logits = arena.logits_tile();
+        std::memset(ref_logits, 0, T * vocab_size * sizeof(float));
 
         const auto& nodes = tree.nodes();
         int32_t curr = 0;
@@ -319,7 +352,8 @@ int main(int argc, char** argv) {
         auto verify_res = tpuforge::SystolicTreeVerifier::verify_greedy(tree, ref_logits, vocab_size);
 
         std::cout << "\n[Host Self-Test: Deterministic Verifier Reference Check]" << std::endl;
-        std::cout << "Nodes Packed: " << packed.active_nodes << " / 128 (Draft + Pack: " << draft_us << " us)" << std::endl;
+        std::cout << "Nodes Packed: " << packed.active_nodes << " / " << T
+                  << " (Draft + Pack: " << draft_us << " us)" << std::endl;
         std::cout << "Tokens Accepted: " << verify_res.acceptance_count << std::endl;
         std::cout << "Bonus/Correction Token: " << verify_res.bonus_token << std::endl;
         std::cout << "Total Tokens Emitted: " << verify_res.emitted_tokens.size() << std::endl;

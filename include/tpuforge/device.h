@@ -18,6 +18,9 @@ struct DeviceInfo {
     int32_t mxu_dim_y{128};
 };
 
+/// Infer systolic MXU array width (128 or 256) from a PJRT/XLA device_kind string.
+int32_t infer_mxu_dim(const std::string& device_kind);
+
 class Device {
 public:
     Device(int32_t id, std::string kind, size_t memory_bytes);

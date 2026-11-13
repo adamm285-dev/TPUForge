@@ -1003,8 +1003,8 @@ ForgeEngine::ForgeEngine(
     if (config_.vocab_size < ByteTokenizer::kMinVocabSize) {
         throw std::invalid_argument("ForgeEngine requires vocab_size >= 260");
     }
-    if (config_.max_seq_len < 2 * SystolicConstants::kSystolicTileSize) {
-        throw std::invalid_argument("ForgeEngine requires max_seq_len >= 256");
+    if (config_.max_seq_len < 2 * config_.tile_size) {
+        throw std::invalid_argument("ForgeEngine requires max_seq_len >= 2 * tile_size");
     }
     if (program_code.empty()) {
         throw std::invalid_argument(
@@ -1012,7 +1012,7 @@ ForgeEngine::ForgeEngine(
         );
     }
     if (model_id_.empty()) {
-        model_id_ = "tpuforge-systolic-128";
+        model_id_ = "tpuforge-systolic-" + std::to_string(config_.tile_size);
     }
     std::string err;
     if (!executor_->compile_once(config_, program_code, program_format, &err)) {
@@ -1040,14 +1040,14 @@ ForgeEngine::ForgeEngine(
     if (config_.vocab_size < ByteTokenizer::kMinVocabSize) {
         throw std::invalid_argument("ForgeEngine requires vocab_size >= 260");
     }
-    if (config_.max_seq_len < 2 * SystolicConstants::kSystolicTileSize) {
-        throw std::invalid_argument("ForgeEngine requires max_seq_len >= 256");
+    if (config_.max_seq_len < 2 * config_.tile_size) {
+        throw std::invalid_argument("ForgeEngine requires max_seq_len >= 2 * tile_size");
     }
     if (!target_step_fn_) {
         throw std::invalid_argument("ForgeEngine custom backend requires a non-null target_step_fn");
     }
     if (model_id_.empty()) {
-        model_id_ = "tpuforge-custom-128";
+        model_id_ = "tpuforge-custom-" + std::to_string(config_.tile_size);
     }
 }
 
@@ -1070,7 +1070,7 @@ std::vector<int32_t> ForgeEngine::validate_request(const GenerationRequest& req)
     if (prompt.empty()) {
         throw std::invalid_argument("Prompt token sequence cannot be empty");
     }
-    const size_t max_prefix = config_.max_seq_len - SystolicConstants::kSystolicTileSize;
+    const size_t max_prefix = config_.max_seq_len - config_.tile_size;
     if (prompt.size() > max_prefix) {
         throw std::invalid_argument(
             "Prompt length (" + std::to_string(prompt.size()) +
@@ -1082,11 +1082,16 @@ std::vector<int32_t> ForgeEngine::validate_request(const GenerationRequest& req)
             throw std::out_of_range("Prompt token ID out of [0, vocab_size) bounds");
         }
     }
+    for (int32_t eos_id : req.eos_token_ids) {
+        if (eos_id < 0 || static_cast<size_t>(eos_id) >= config_.vocab_size) {
+            throw std::out_of_range("eos_token_id out of [0, vocab_size) bounds");
+        }
+    }
     return prompt;
 }
 
 void ForgeEngine::execute_tile_step() {
-    constexpr size_t T = SystolicConstants::kSystolicTileSize;
+    const size_t T = config_.tile_size;
     if (executor_) {
         std::string err;
         if (!executor_->execute_step_with_kv(arena_, &pjrt_step_k_, &pjrt_step_v_, T, &err)) {
@@ -1095,10 +1100,10 @@ void ForgeEngine::execute_tile_step() {
     } else {
         target_step_fn_(
             arena_.valid_prefix_len(),
-            arena_.token_tile_128(),
-            arena_.position_tile_128(),
-            arena_.causal_mask_128x128(),
-            arena_.logits_tile_128()
+            arena_.token_tile(),
+            arena_.position_tile(),
+            arena_.causal_mask(),
+            arena_.logits_tile()
         );
     }
 }
@@ -1112,7 +1117,7 @@ GenerationResult ForgeEngine::generate(
 
     std::scoped_lock lk(engine_mu_);
 
-    constexpr size_t T = SystolicConstants::kSystolicTileSize;
+    const size_t T = config_.tile_size;
     const size_t max_prefix = config_.max_seq_len - T;
 
     arena_.set_valid_prefix_len(0);
@@ -1120,17 +1125,17 @@ GenerationResult ForgeEngine::generate(
     GenerationResult result;
     result.prompt_tokens_count = prompt.size();
 
-    // 1. Static 128-row causal prefill over prompt[0 .. N-2].
-    // The final prompt token becomes the root of the first 128-node speculative decode tree.
+    // 1. Static T-row causal prefill over prompt[0 .. N-2].
+    // The final prompt token becomes the root of the first T-node speculative decode tree.
     const size_t prefill_len = prompt.size() - 1;
     std::vector<int32_t> prefill_accepted;
     prefill_accepted.reserve(T);
 
     for (size_t offset = 0; offset < prefill_len; offset += T) {
         const size_t chunk = std::min(T, prefill_len - offset);
-        int32_t* tok_tile = arena_.token_tile_128();
-        int32_t* pos_tile = arena_.position_tile_128();
-        float* mask_tile = arena_.causal_mask_128x128();
+        int32_t* tok_tile = arena_.token_tile();
+        int32_t* pos_tile = arena_.position_tile();
+        float* mask_tile = arena_.causal_mask();
 
         std::fill_n(tok_tile, T, ByteTokenizer::kPadToken);
         std::fill_n(pos_tile, T, 0);
@@ -1166,13 +1171,21 @@ GenerationResult ForgeEngine::generate(
         }
     }
 
-    // 2. 128-node systolic tree speculative decode loop.
+    // 2. T-node systolic tree speculative decode loop.
     std::vector<int32_t> history = std::move(prompt);
     std::vector<int32_t> generated;
     generated.reserve(req.max_tokens);
     Utf8StreamDecoder utf8_decoder;
     bool client_aborted = false;
     bool hit_eos = false;
+
+    auto is_eos_token = [&req](int32_t tok) -> bool {
+        if (req.eos_token_ids.empty()) {
+            return tok == ByteTokenizer::kEosToken;
+        }
+        return std::find(req.eos_token_ids.begin(), req.eos_token_ids.end(), tok) !=
+               req.eos_token_ids.end();
+    };
 
     while (generated.size() < req.max_tokens &&
            static_cast<size_t>(arena_.valid_prefix_len()) < max_prefix) {
@@ -1182,13 +1195,13 @@ GenerationResult ForgeEngine::generate(
         const size_t max_depth = std::min<size_t>(16, remaining_prefix);
 
         SystolicTree tree = SuffixTreeDrafter::build_tree(
-            history, SystolicTree::kMaxNodes, std::max<size_t>(1, max_depth)
+            history, T, std::max<size_t>(1, max_depth), T
         );
         PackedSystolicTile packed = tree.pack(cur_prefix);
 
-        std::memcpy(arena_.token_tile_128(), packed.token_ids.data(), T * sizeof(int32_t));
-        std::memcpy(arena_.position_tile_128(), packed.position_offsets.data(), T * sizeof(int32_t));
-        std::memcpy(arena_.causal_mask_128x128(), packed.additive_mask_f32.data(), T * T * sizeof(float));
+        std::memcpy(arena_.token_tile(), packed.token_ids.data(), T * sizeof(int32_t));
+        std::memcpy(arena_.position_tile(), packed.position_offsets.data(), T * sizeof(int32_t));
+        std::memcpy(arena_.causal_mask(), packed.additive_mask_f32.data(), T * T * sizeof(float));
 
         execute_tile_step();
         result.target_forward_passes += 1;
@@ -1197,7 +1210,7 @@ GenerationResult ForgeEngine::generate(
         TreeVerificationResult verify_res;
         if (req.temperature < 1e-6f) {
             verify_res = SystolicTreeVerifier::verify_greedy(
-                tree, arena_.logits_tile_128(), config_.vocab_size
+                tree, arena_.logits_tile(), config_.vocab_size
             );
         } else {
             const uint64_t step_seed = splitmix64(
@@ -1213,7 +1226,7 @@ GenerationResult ForgeEngine::generate(
         const size_t limit = std::min(budget, verify_res.emitted_tokens.size());
         for (size_t i = 0; i < limit; ++i) {
             const int32_t tok = verify_res.emitted_tokens[i];
-            if (!req.ignore_eos && tok == ByteTokenizer::kEosToken) {
+            if (!req.ignore_eos && is_eos_token(tok)) {
                 hit_eos = true;
                 break;
             }

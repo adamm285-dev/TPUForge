@@ -149,4 +149,90 @@ void KVCacheManager::release_pages(const std::vector<int32_t>& page_ids) {
     }
 }
 
+IciRingPlan IciRingPlanner::plan(const KVCacheManager::Config& kv_config, size_t ring_size) {
+    if (ring_size == 0 || ring_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::invalid_argument("IciRingPlanner::plan requires 1 <= ring_size <= INT32_MAX");
+    }
+    if (kv_config.num_layers == 0 || kv_config.num_kv_heads == 0 ||
+        kv_config.head_dim == 0 || kv_config.page_size == 0 || kv_config.max_seq_len == 0) {
+        throw std::invalid_argument("IciRingPlanner::plan requires all dimensions and max_seq_len > 0");
+    }
+    if (kv_config.max_seq_len > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::length_error("IciRingPlanner::plan max_seq_len exceeds INT32_MAX");
+    }
+    if (kv_config.max_seq_len % ring_size != 0) {
+        throw std::invalid_argument("IciRingPlanner::plan max_seq_len must be divisible by ring_size");
+    }
+    const size_t chunk_seq_len = kv_config.max_seq_len / ring_size;
+    if (chunk_seq_len % kv_config.page_size != 0) {
+        throw std::invalid_argument("IciRingPlanner::plan chunk_seq_len must be divisible by page_size");
+    }
+
+    const size_t elem_size = dtype_size_bytes(kv_config.dtype);
+    size_t bytes_per_rank = checked_mul(2, kv_config.num_layers, "ring_layers");
+    bytes_per_rank = checked_mul(bytes_per_rank, kv_config.num_kv_heads, "ring_kv_heads");
+    bytes_per_rank = checked_mul(bytes_per_rank, kv_config.head_dim, "ring_head_dim");
+    bytes_per_rank = checked_mul(bytes_per_rank, chunk_seq_len, "ring_chunk_seq_len");
+    bytes_per_rank = checked_mul(bytes_per_rank, elem_size, "bytes_per_rank");
+    const size_t total_cluster_bytes = checked_mul(bytes_per_rank, ring_size, "total_cluster_bytes");
+
+    IciRingPlan p;
+    p.ring_size = ring_size;
+    p.total_seq_len = kv_config.max_seq_len;
+    p.chunk_seq_len = chunk_seq_len;
+    p.pages_per_rank = chunk_seq_len / kv_config.page_size;
+    p.bytes_per_rank = bytes_per_rank;
+    p.total_cluster_bytes = total_cluster_bytes;
+    p.send_perm.reserve(ring_size);
+    p.chunk_start_positions.reserve(ring_size);
+
+    for (size_t r = 0; r < ring_size; ++r) {
+        p.send_perm.emplace_back(
+            static_cast<int32_t>(r),
+            static_cast<int32_t>((r + 1) % ring_size)
+        );
+        p.chunk_start_positions.push_back(static_cast<int32_t>(r * chunk_seq_len));
+    }
+    return p;
+}
+
+size_t IciRingPlanner::source_rank_at_step(size_t dst_rank, size_t step, size_t ring_size) {
+    if (ring_size == 0) {
+        throw std::invalid_argument("IciRingPlanner::source_rank_at_step requires ring_size >= 1");
+    }
+    if (dst_rank >= ring_size) {
+        throw std::out_of_range("IciRingPlanner::source_rank_at_step dst_rank >= ring_size");
+    }
+    return (dst_rank + ring_size - (step % ring_size)) % ring_size;
+}
+
+std::vector<uint8_t> IciRingPlanner::causal_active_hops(
+    size_t query_rank,
+    size_t ring_size,
+    size_t chunk_seq_len,
+    size_t valid_seq_len
+) {
+    if (ring_size == 0 || chunk_seq_len == 0) {
+        throw std::invalid_argument("IciRingPlanner::causal_active_hops requires ring_size >= 1 and chunk_seq_len >= 1");
+    }
+    if (query_rank >= ring_size) {
+        throw std::out_of_range("IciRingPlanner::causal_active_hops query_rank >= ring_size");
+    }
+
+    std::vector<uint8_t> active(ring_size, 0);
+    const size_t q_start = checked_mul(query_rank, chunk_seq_len, "q_start");
+    if (valid_seq_len == 0 || q_start >= valid_seq_len) {
+        return active;
+    }
+
+    const size_t q_end = std::min(checked_mul(query_rank + 1, chunk_seq_len, "q_end"), valid_seq_len);
+    const size_t q_max_pos = q_end - 1;
+    for (size_t step = 0; step < ring_size; ++step) {
+        const size_t kv_rank = source_rank_at_step(query_rank, step, ring_size);
+        const size_t kv_min_pos = checked_mul(kv_rank, chunk_seq_len, "kv_min_pos");
+        active[step] = (kv_min_pos <= q_max_pos && kv_min_pos < valid_seq_len) ? 1 : 0;
+    }
+    return active;
+}
+
 } // namespace tpuforge

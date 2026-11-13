@@ -89,20 +89,20 @@ public:
     );
 
     // Executes one systolic step via official PJRT host->device buffers and execution.
-    // Throws std::invalid_argument if tile_rows != 128 to prevent shape polymorphism.
+    // tile_rows == 0 uses arena.tile_size() (128 or 256). Throws std::invalid_argument for invalid tile_rows.
     bool execute_step(
         StaticArena& arena,
-        size_t tile_rows = SystolicConstants::kSystolicTileSize,
+        size_t tile_rows = 0,
         std::string* error_out = nullptr
     );
 
     // Executes one stateful systolic step with prefix KV buffers uploaded [max_seq_len, kv_row_elems]
-    // and step KV outputs [128, kv_row_elems] downloaded alongside logits [128, vocab_size].
+    // and step KV outputs [tile_rows, kv_row_elems] downloaded alongside logits [tile_rows, vocab_size].
     bool execute_step_with_kv(
         StaticArena& arena,
         std::vector<float>* out_step_k,
         std::vector<float>* out_step_v,
-        size_t tile_rows = SystolicConstants::kSystolicTileSize,
+        size_t tile_rows = 0,
         std::string* error_out = nullptr
     );
 
