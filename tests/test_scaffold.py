@@ -22,17 +22,20 @@ def test_core_engine_headers_and_sources_present():
 
 
 def test_native_clang_build_and_bench_execution():
+    import shutil
+
     root = Path(__file__).resolve().parent.parent
     env = os.environ.copy()
     ucrt_bin = r"C:\msys64\ucrt64\bin"
     if os.path.isdir(ucrt_bin) and ucrt_bin not in env.get("PATH", ""):
         env["PATH"] = f"{ucrt_bin};{env.get('PATH', '')}"
 
+    cmake_bin = shutil.which("cmake", path=env.get("PATH")) or r"C:\msys64\ucrt64\bin\cmake.exe"
     build_dir = root / "build"
     if not (build_dir / "build.ninja").exists():
         cfg = subprocess.run(
             [
-                "cmake",
+                cmake_bin,
                 "-B",
                 "build",
                 "-S",
@@ -51,7 +54,7 @@ def test_native_clang_build_and_bench_execution():
         assert cfg.returncode == 0, f"CMake configure failed:\n{cfg.stderr}"
 
     bld = subprocess.run(
-        ["cmake", "--build", "build"],
+        [cmake_bin, "--build", "build"],
         cwd=str(root),
         env=env,
         capture_output=True,
