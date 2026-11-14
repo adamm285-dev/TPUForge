@@ -363,6 +363,7 @@ def test_kaggle_bundle_packaging(tmp_path: Path) -> None:
             "include/tpuforge/device.h",
             "src/main.cpp",
             "benchmarks/quantization_jax.py",
+            "benchmarks/moe_streaming_jax.py",
             "benchmarks/qwen_jax.py",
             "benchmarks/block_diffusion_jax.py",
             "benchmarks/run_qwen_bench.py",
