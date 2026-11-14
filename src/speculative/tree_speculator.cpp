@@ -743,7 +743,7 @@ SystolicTree TreeBuilder::build_from_block_top_k(
 
     std::priority_queue<EdgeItem> pq;
 
-    auto push_dflash_edges = [&](int32_t parent_idx, size_t start_k) {
+    auto push_block_edges = [&](int32_t parent_idx, size_t start_k) {
         const size_t depth = static_cast<size_t>(tree.nodes()[static_cast<size_t>(parent_idx)].depth);
         if (depth >= block_steps || depth >= max_depth || top_k == 0) {
             return;
@@ -786,7 +786,7 @@ SystolicTree TreeBuilder::build_from_block_top_k(
             continue;
         }
         if (d < block_steps && top_k > 1) {
-            push_dflash_edges(spine_idx, 1);
+            push_block_edges(spine_idx, 1);
         }
         if (suffix_fallback != nullptr) {
             const float discount = (d >= block_steps) ? 0.5f : 0.05f;
@@ -816,7 +816,7 @@ SystolicTree TreeBuilder::build_from_block_top_k(
             continue;
         }
         if (child_depth < block_steps && top_k > 0) {
-            push_dflash_edges(child_idx, 0);
+            push_block_edges(child_idx, 0);
         } else if (suffix_fallback != nullptr) {
             push_suffix_edges(child_idx, 0.5f);
         }

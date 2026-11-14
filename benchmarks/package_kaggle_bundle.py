@@ -13,7 +13,7 @@ DEFAULT_INCLUDE_PATHS = (
     "include",
     "src",
     "benchmarks/qwen_jax.py",
-    "benchmarks/dflash_jax.py",
+    "benchmarks/block_diffusion_jax.py",
     "benchmarks/ring_attention_jax.py",
     "benchmarks/run_qwen_bench.py",
     "benchmarks/package_kaggle_bundle.py",

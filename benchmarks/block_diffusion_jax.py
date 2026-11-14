@@ -1,4 +1,4 @@
-"""Pure-JAX DFlash block-diffusion systolic tree drafter for TPUForge."""
+"""Pure-JAX block-diffusion systolic tree drafter for TPUForge."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ from benchmarks.qwen_jax import (
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> tuple[int, ...]:
-    """Compute default uniformly spaced target layer indices matching DFlash."""
+    """Compute default uniformly spaced target layer indices for block-diffusion capture."""
     if num_target_layers <= 0 or num_draft_layers <= 0:
         raise ValueError("num_target_layers and num_draft_layers must be positive")
     if num_draft_layers == 1:
@@ -57,8 +57,8 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> tup
 
 
 @dataclass(frozen=True)
-class DFlashConfig:
-    """Configuration for a DFlash block-diffusion draft checkpoint."""
+class BlockDiffusionConfig:
+    """Configuration for a parallel block-diffusion draft checkpoint (supports DFlash config schema)."""
 
     hidden_size: int
     num_hidden_layers: int
@@ -79,12 +79,12 @@ class DFlashConfig:
         cls,
         model_dir: Path,
         target_config: QwenConfig | None = None,
-    ) -> DFlashConfig:
+    ) -> BlockDiffusionConfig:
         cfg_path = model_dir / "config.json"
         if not cfg_path.is_file():
             raise FileNotFoundError(f"Missing config.json in {model_dir}")
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-        dcfg = raw.get("dflash_config") or {}
+        dcfg = raw.get("block_diffusion_config") or raw.get("dflash_config") or {}
 
         hidden_size = int(raw.get("hidden_size") or (target_config.hidden_size if target_config else 0))
         num_layers = int(raw["num_hidden_layers"])
@@ -98,11 +98,11 @@ class DFlashConfig:
 
         block_size = int(dcfg.get("block_size", raw.get("block_size", 16)))
         if block_size < 2:
-            raise ValueError(f"DFlash block_size must be >= 2, got {block_size}")
+            raise ValueError(f"BlockDiffusion block_size must be >= 2, got {block_size}")
 
         mask_raw = dcfg.get("mask_token_id", raw.get("mask_token_id"))
         if mask_raw is None:
-            raise KeyError(f"Missing mask_token_id in DFlash config: {cfg_path}")
+            raise KeyError(f"Missing mask_token_id in BlockDiffusion config: {cfg_path}")
         mask_token_id = int(mask_raw)
 
         num_target_raw = raw.get(
@@ -112,13 +112,13 @@ class DFlashConfig:
         raw_layer_ids = dcfg.get("target_layer_ids", raw.get("target_layer_ids"))
         if raw_layer_ids is None:
             if num_target_raw is None:
-                raise KeyError("Missing both target_layer_ids and num_target_layers in DFlash config")
+                raise KeyError("Missing both target_layer_ids and num_target_layers in BlockDiffusion config")
             num_target_layers = int(num_target_raw)
             target_layer_ids = build_target_layer_ids(num_target_layers, num_layers)
         else:
             target_layer_ids = tuple(int(x) for x in raw_layer_ids)
             if not target_layer_ids:
-                raise ValueError("DFlash target_layer_ids cannot be empty")
+                raise ValueError("BlockDiffusion target_layer_ids cannot be empty")
             num_target_layers = (
                 int(num_target_raw) if num_target_raw is not None else (max(target_layer_ids) + 1)
             )
@@ -126,7 +126,7 @@ class DFlashConfig:
         for lid in target_layer_ids:
             if lid < 0 or lid >= num_target_layers:
                 raise ValueError(
-                    f"DFlash target_layer_id {lid} out of range [0, {num_target_layers})"
+                    f"BlockDiffusion target_layer_id {lid} out of range [0, {num_target_layers})"
                 )
 
         return cls(
@@ -170,8 +170,8 @@ def _place_np_sharded(
 
 
 @dataclass
-class DFlashWeights:
-    """Stacked (optionally TP-sharded) JAX device arrays for a DFlash block drafter."""
+class BlockDiffusionWeights:
+    """Stacked (optionally TP-sharded) JAX device arrays for a block-diffusion drafter."""
 
     fc: jax.Array
     hidden_norm: jax.Array
@@ -196,10 +196,10 @@ class DFlashWeights:
     def from_numpy_dict(
         cls,
         raw: dict[str, np.ndarray],
-        config: DFlashConfig,
+        config: BlockDiffusionConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
-    ) -> DFlashWeights:
+    ) -> BlockDiffusionWeights:
         np_dtype = _jnp_to_numpy_dtype(dtype)
         top_prefix = "" if "fc.weight" in raw else ("model." if "model.fc.weight" in raw else "")
         layer_prefix = (
@@ -211,7 +211,7 @@ class DFlashWeights:
         def get_top(name: str, transpose: bool = False) -> jax.Array:
             key = f"{top_prefix}{name}"
             if key not in raw:
-                raise KeyError(f"Missing DFlash tensor {key!r}")
+                raise KeyError(f"Missing block-drafter tensor {key!r}")
             arr = raw[key]
             if transpose:
                 arr = np.ascontiguousarray(arr.T)
@@ -222,7 +222,7 @@ class DFlashWeights:
             for i in range(config.num_hidden_layers):
                 key = f"{layer_prefix}layers.{i}.{suffix}"
                 if key not in raw:
-                    raise KeyError(f"Missing DFlash tensor {key!r}")
+                    raise KeyError(f"Missing block-drafter tensor {key!r}")
                 arr = raw[key]
                 if transpose:
                     arr = np.ascontiguousarray(arr.T)
@@ -263,10 +263,10 @@ class DFlashWeights:
     def from_model_dir(
         cls,
         model_dir: Path,
-        config: DFlashConfig,
+        config: BlockDiffusionConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
-    ) -> DFlashWeights:
+    ) -> BlockDiffusionWeights:
         tensor_loc = _iter_safetensors_index(model_dir)
         np_dtype = _jnp_to_numpy_dtype(dtype)
         tp_size = mesh.size if mesh is not None else 1
@@ -282,7 +282,7 @@ class DFlashWeights:
             def read_top(name: str, transpose: bool = False) -> jax.Array:
                 key = f"{top_prefix}{name}"
                 if key not in tensor_loc:
-                    raise KeyError(f"Missing DFlash tensor {key!r}")
+                    raise KeyError(f"Missing block-drafter tensor {key!r}")
                 arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
                 if transpose:
                     arr = np.ascontiguousarray(arr.T)
@@ -292,7 +292,7 @@ class DFlashWeights:
                 num_layers = config.num_hidden_layers
                 key0 = f"{layer_prefix}layers.0.{suffix}"
                 if key0 not in tensor_loc:
-                    raise KeyError(f"Missing DFlash tensor {key0!r}")
+                    raise KeyError(f"Missing block-drafter tensor {key0!r}")
                 raw_shape0 = tensor_loc[key0][2]
                 layer_shape = tuple(reversed(raw_shape0)) if transpose else raw_shape0
                 full_shape = (num_layers,) + layer_shape
@@ -369,31 +369,31 @@ class DFlashWeights:
             )
 
 
-class QwenDFlashRunner:
-    """Runs DFlash block-diffusion drafting coupled to a Qwen systolic tree target verifier."""
+class QwenBlockTreeRunner:
+    """Runs block-diffusion parallel drafting packed with O(1) suffix continuations on systolic tiles."""
 
     def __init__(
         self,
         target_runner: QwenBenchmarkRunner,
-        dflash_config: DFlashConfig,
-        dflash_weights: DFlashWeights,
+        draft_config: BlockDiffusionConfig,
+        draft_weights: BlockDiffusionWeights,
         top_k: int = 8,
     ) -> None:
-        if top_k <= 0 or top_k > dflash_config.vocab_size:
-            raise ValueError(f"top_k={top_k} must be in [1, {dflash_config.vocab_size}]")
-        if dflash_config.hidden_size != target_runner.config.hidden_size:
+        if top_k <= 0 or top_k > draft_config.vocab_size:
+            raise ValueError(f"top_k={top_k} must be in [1, {draft_config.vocab_size}]")
+        if draft_config.hidden_size != target_runner.config.hidden_size:
             raise ValueError(
-                f"DFlash hidden_size ({dflash_config.hidden_size}) != target ({target_runner.config.hidden_size})"
+                f"BlockDiffusion hidden_size ({draft_config.hidden_size}) != target ({target_runner.config.hidden_size})"
             )
-        if dflash_config.num_target_layers != target_runner.config.num_hidden_layers:
+        if draft_config.num_target_layers != target_runner.config.num_hidden_layers:
             raise ValueError(
-                f"DFlash num_target_layers ({dflash_config.num_target_layers}) != "
+                f"BlockDiffusion num_target_layers ({draft_config.num_target_layers}) != "
                 f"target num_hidden_layers ({target_runner.config.num_hidden_layers})"
             )
 
         self.target = target_runner
-        self.dflash_config = dflash_config
-        self.dflash_weights = dflash_weights
+        self.draft_config = draft_config
+        self.draft_weights = draft_weights
         self.top_k = int(top_k)
 
         self.max_seq_len = target_runner.max_seq_len
@@ -406,15 +406,15 @@ class QwenDFlashRunner:
         self.commit_both_kv_compile_count = 0
         self.draft_step_compile_count = 0
 
-        layer_map = {lid: idx for idx, lid in enumerate(dflash_config.target_layer_ids)}
-        num_captured = len(dflash_config.target_layer_ids)
+        layer_map = {lid: idx for idx, lid in enumerate(draft_config.target_layer_ids)}
+        num_captured = len(draft_config.target_layer_ids)
         capture_slots_np = np.array(
             [layer_map.get(i, num_captured) for i in range(target_runner.config.num_hidden_layers)],
             dtype=np.int32,
         )
         self._capture_slots = target_runner._put_rep(capture_slots_np, dtype=jnp.int32)
 
-        dw = dflash_weights
+        dw = draft_weights
         self._draft_weights_tuple: tuple[jax.Array | None, ...] = (
             dw.fc,
             dw.hidden_norm,
@@ -435,11 +435,11 @@ class QwenDFlashRunner:
             dw.k_norm,
         )
 
-        self._compile_dflash_kernels()
+        self._compile_block_tree_kernels()
 
-    def _compile_dflash_kernels(self) -> None:
+    def _compile_block_tree_kernels(self) -> None:
         tcfg = self.target.config
-        dcfg = self.dflash_config
+        dcfg = self.draft_config
         max_seq = self.max_seq_len
         tile_size = self.tile_size
         block_size = dcfg.block_size
@@ -586,7 +586,7 @@ class QwenDFlashRunner:
                 v_next = jax.lax.with_sharding_constraint(v_next, kv_cache_sharding)
 
             gathered_ctx = step_ctx_features[src_rows]
-            # DFlash projects + normalizes target_hidden once before feeding every draft layer k/v.
+            # Project and normalize target hidden features once before feeding draft layer K/V.
             target_h = _rms_norm(_linear(gathered_ctx, fc), hidden_norm, dcfg.rms_norm_eps)
             if rep_sharding is not None:
                 target_h = jax.lax.with_sharding_constraint(target_h, rep_sharding)
@@ -623,7 +623,7 @@ class QwenDFlashRunner:
             return k_next, v_next, dk_next, dv_next
 
         @jax.jit
-        def dflash_draft_top_k_jit(
+        def block_draft_top_k_jit(
             embed: jax.Array,
             lm_head: jax.Array,
             draft_wt: tuple[jax.Array | None, ...],
@@ -694,7 +694,7 @@ class QwenDFlashRunner:
 
         self._target_tile_with_ctx_jit = target_tile_with_ctx_jit
         self._commit_both_kv_jit = commit_both_kv_jit
-        self._dflash_draft_top_k_jit = dflash_draft_top_k_jit
+        self._block_draft_top_k_jit = block_draft_top_k_jit
 
     def total_compile_count(self) -> int:
         return (
@@ -704,7 +704,7 @@ class QwenDFlashRunner:
         )
 
     def warmup(self) -> float:
-        """Warm up all DFlash + target JIT kernels once so steady-state runs have 0 compiles."""
+        """Warm up all block-drafter and target JIT kernels once so steady-state runs have 0 compiles."""
         t0 = time.perf_counter()
         T = self.tile_size
         k_cache, v_cache = self.target._empty_kv_cache()
@@ -737,7 +737,7 @@ class QwenDFlashRunner:
             src_rows,
             self.target._put_rep(1, dtype=jnp.int32),
         )
-        t_ids, t_probs = self._dflash_draft_top_k_jit(
+        t_ids, t_probs = self._block_draft_top_k_jit(
             self.target._weights_tuple[0],
             self.target._weights_tuple[2],
             self._draft_weights_tuple,
@@ -749,14 +749,14 @@ class QwenDFlashRunner:
         jax.block_until_ready((argmax_t, k_n, v_n, dk_n, dv_n, t_ids, t_probs))
         return time.perf_counter() - t0
 
-    def run_dflash_tree(
+    def run_block_tree(
         self,
         prompt_tokens: list[int],
         max_new_tokens: int,
         eos_token_ids: Iterable[int] | None = None,
         use_suffix_fallback: bool = True,
     ) -> RunMetrics:
-        """Run native C++ ForgeEngine with DFlash block-diffusion drafting packed into 128/256 tile."""
+        """Run native C++ ForgeEngine with block-diffusion drafting packed into 128/256 tile."""
         self.target._validate_bounds(prompt_tokens, max_new_tokens)
         T = self.tile_size
         eos_list = (
@@ -863,7 +863,7 @@ class QwenDFlashRunner:
             tile_size: int,
         ) -> tpu.SystolicTree:
             root_tok = int(history_arr[-1])
-            top_ids_dev, top_probs_dev = self._dflash_draft_top_k_jit(
+            top_ids_dev, top_probs_dev = self._block_draft_top_k_jit(
                 embed,
                 lm_head,
                 draft_wt,
@@ -898,7 +898,7 @@ class QwenDFlashRunner:
             arena_cfg,
             None,
             commit_kv_fn,
-            f"qwen-tpuforge-dflash-{T}",
+            f"qwen-tpuforge-block-tree-{T}",
             prefill_step_fn=prefill_step_fn,
             greedy_step_fn=greedy_step_fn,
             draft_tree_fn=draft_tree_fn,
@@ -923,7 +923,7 @@ class QwenDFlashRunner:
         decode_s = t_all1 - t_split
         gen_len = len(token_ids)
         return RunMetrics(
-            mode="tpuforge_dflash",
+            mode="tpuforge_block_tree",
             token_ids=token_ids,
             text=self.target._decode_text(token_ids),
             prompt_len=len(prompt_tokens),
@@ -938,16 +938,16 @@ class QwenDFlashRunner:
             draft_tokens_accepted=int(res.draft_tokens_accepted),
             mean_tokens_per_decode_pass=float(res.mean_tokens_per_decode_pass),
             extra={
-                "block_size": self.dflash_config.block_size,
+                "block_size": self.draft_config.block_size,
                 "top_k": self.top_k,
-                "draft_layers": self.dflash_config.num_hidden_layers,
+                "draft_layers": self.draft_config.num_hidden_layers,
                 "tile_size": self.tile_size,
                 "tp_size": self.tp_size,
             },
         )
 
 
-def load_qwen_dflash_runner(
+def load_qwen_block_tree_runner(
     model_id_or_path: str,
     draft_model_id_or_path: str,
     max_seq_len: int = 2048,
@@ -956,8 +956,8 @@ def load_qwen_dflash_runner(
     tp_size: int | str = "auto",
     top_k: int = 8,
     enable_xla_cache: bool = True,
-) -> tuple[QwenDFlashRunner, Path, Path]:
-    """Resolve and load target Qwen + DFlash checkpoints concurrently onto TPU HBM."""
+) -> tuple[QwenBlockTreeRunner, Path, Path]:
+    """Resolve and load target Qwen + block-diffusion draft checkpoints concurrently onto TPU HBM."""
     from tokenizers import Tokenizer
 
     if enable_xla_cache:
@@ -970,7 +970,7 @@ def load_qwen_dflash_runner(
         draft_dir = f_draft.result()
 
     target_config = QwenConfig.from_dir(target_dir)
-    dflash_config = DFlashConfig.from_dir(draft_dir, target_config=target_config)
+    draft_config = BlockDiffusionConfig.from_dir(draft_dir, target_config=target_config)
     tok_path = target_dir / "tokenizer.json"
     if not tok_path.is_file():
         raise FileNotFoundError(f"Missing tokenizer.json in {target_dir}")
@@ -979,7 +979,7 @@ def load_qwen_dflash_runner(
     dtype = resolve_default_dtype(dtype_name)
     _, mesh = resolve_tp_mesh(tp_size, config=target_config)
     target_weights = QwenWeights.from_model_dir(target_dir, target_config, dtype=dtype, mesh=mesh)
-    draft_weights = DFlashWeights.from_model_dir(draft_dir, dflash_config, dtype=dtype, mesh=mesh)
+    draft_weights = BlockDiffusionWeights.from_model_dir(draft_dir, draft_config, dtype=dtype, mesh=mesh)
 
     base_runner = QwenBenchmarkRunner(
         config=target_config,
@@ -989,10 +989,10 @@ def load_qwen_dflash_runner(
         tile_size=tile_size,
         mesh=mesh,
     )
-    dflash_runner = QwenDFlashRunner(
+    block_runner = QwenBlockTreeRunner(
         target_runner=base_runner,
-        dflash_config=dflash_config,
-        dflash_weights=draft_weights,
+        draft_config=draft_config,
+        draft_weights=draft_weights,
         top_k=top_k,
     )
-    return dflash_runner, target_dir, draft_dir
+    return block_runner, target_dir, draft_dir

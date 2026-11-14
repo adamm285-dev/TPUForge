@@ -1,4 +1,4 @@
-"""Tests for O(1) SuffixIndex, Block-TopK systolic tree packing, and DFlash XLA execution."""
+"""Tests for O(1) SuffixIndex, Block-TopK systolic tree packing, and block-diffusion XLA execution."""
 
 from __future__ import annotations
 
@@ -18,7 +18,10 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
-from benchmarks.dflash_jax import load_qwen_dflash_runner
+from benchmarks.block_diffusion_jax import (
+    BlockDiffusionConfig,
+    load_qwen_block_tree_runner,
+)
 from benchmarks.qwen_jax import configure_xla_compilation_cache
 
 
@@ -66,10 +69,10 @@ def _build_word_tokenizer(vocab_size: int, save_path: Path) -> Tokenizer:
     return tok
 
 
-def _build_qwen3_and_dflash_dirs(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a deterministic Qwen3 (q/k norm, no attn bias) + DFlash checkpoint pair."""
+def _build_qwen3_and_block_drafter_dirs(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a deterministic Qwen3 (q/k norm, no attn bias) + block-diffusion drafter checkpoint pair."""
     target_dir = tmp_path / "qwen3_target"
-    draft_dir = tmp_path / "qwen3_dflash"
+    draft_dir = tmp_path / "qwen3_block_drafter"
     target_dir.mkdir(parents=True, exist_ok=True)
     draft_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,7 +171,7 @@ def _build_qwen3_and_dflash_dirs(tmp_path: Path) -> tuple[Path, Path]:
         t_tensors[f"model.layers.{i}.mlp.down_proj.weight"] = np.zeros((H, inter), dtype=np.float32)
     _write_safetensors(target_dir / "model.safetensors", t_tensors)
 
-    # DFlash Layer 0 uses RoPE relative offsets on freq_idx=1 to route root_tok -> step s (1..7).
+    # Draft Layer 0 uses RoPE relative offsets on freq_idx=1 to route root_tok -> step s (1..7).
     half = hd // 2  # 32
     freq_band = 1
     mask_band = 31
@@ -333,7 +336,7 @@ def test_tree_builder_block_top_k_spine_and_suffix_hybrid() -> None:
         child_tokens = [nodes[c].token_id for c in node.children]
         assert len(child_tokens) == len(set(child_tokens))
 
-    # Also test exact suffix continuation beyond DFlash horizon when top-1 hits suffix trigger
+    # Also test exact suffix continuation beyond block-diffusion horizon when top-1 hits suffix trigger
     draft_ids_s = draft_ids.copy()
     draft_ids_s[13, 0] = 113
     draft_ids_s[14, 0] = 114
@@ -352,12 +355,23 @@ def test_tree_builder_block_top_k_spine_and_suffix_hybrid() -> None:
     assert {201, 202, 203}.issubset(ext_tokens)
 
 
-def test_qwen3_dflash_cold_prompt_acceleration_and_exact_parity(tmp_path: Path) -> None:
+def test_qwen3_block_tree_cold_prompt_acceleration_and_exact_parity(tmp_path: Path) -> None:
     cache_dir = configure_xla_compilation_cache(tmp_path / "xla_cache")
     assert cache_dir is not None and cache_dir.is_dir()
 
-    target_dir, draft_dir = _build_qwen3_and_dflash_dirs(tmp_path)
-    runner, resolved_t, resolved_d = load_qwen_dflash_runner(
+    target_dir, draft_dir = _build_qwen3_and_block_drafter_dirs(tmp_path)
+    cfg_raw = json.loads((draft_dir / "config.json").read_text(encoding="utf-8"))
+    for alt_key in ("block_diffusion_config", "dflash_config"):
+        alt_dir = tmp_path / f"schema_{alt_key}"
+        alt_dir.mkdir(exist_ok=True)
+        alt_payload = dict(cfg_raw)
+        nested = alt_payload.pop("dflash_config", None) or alt_payload.pop("block_diffusion_config", {})
+        alt_payload[alt_key] = nested
+        (alt_dir / "config.json").write_text(json.dumps(alt_payload), encoding="utf-8")
+        parsed = BlockDiffusionConfig.from_dir(alt_dir)
+        assert parsed.block_size == BlockDiffusionConfig.from_dir(draft_dir).block_size
+
+    runner, resolved_t, resolved_d = load_qwen_block_tree_runner(
         str(target_dir),
         str(draft_dir),
         max_seq_len=512,
@@ -373,7 +387,7 @@ def test_qwen3_dflash_cold_prompt_acceleration_and_exact_parity(tmp_path: Path) 
     # Verify Qwen3 optional fields loaded cleanly (no bias, with q_norm/k_norm)
     assert runner.target.weights.bq is None
     assert runner.target.weights.q_norm is not None
-    assert runner.dflash_weights.q_norm is not None
+    assert runner.draft_weights.q_norm is not None
 
     runner.warmup()
     # Warm vanilla/static on a throwaway run to verify 0 steady-state compiles
@@ -383,29 +397,33 @@ def test_qwen3_dflash_cold_prompt_acceleration_and_exact_parity(tmp_path: Path) 
     vanilla = runner.target.run_vanilla_jax(cold_prompt, max_new_tokens=21)
     static = runner.target.run_static_arena(cold_prompt, max_new_tokens=21)
     suffix_only = runner.target.run_tpuforge_tree(cold_prompt, max_new_tokens=21)
-    dflash = runner.run_dflash_tree(cold_prompt, max_new_tokens=21)
+    block_tree = runner.run_block_tree(cold_prompt, max_new_tokens=21)
 
     expected = [8 + ((i + 1) % 16) for i in range(21)]
     assert vanilla.token_ids == expected
     assert static.token_ids == expected
     assert suffix_only.token_ids == expected
-    assert dflash.token_ids == expected
+    assert block_tree.token_ids == expected
+    assert block_tree.mode == "tpuforge_block_tree"
 
-    # Cold non-repeating prompt: suffix stays near 1.0 tok/pass, DFlash hits >= 5.0 tok/pass
+    # Cold non-repeating prompt: suffix stays near 1.0 tok/pass, block-tree hits >= 5.0 tok/pass
     assert suffix_only.mean_tokens_per_decode_pass <= 1.5
-    assert dflash.mean_tokens_per_decode_pass >= 5.0
-    assert dflash.decode_passes <= 5
-    assert dflash.compile_count == 0
+    assert block_tree.mean_tokens_per_decode_pass >= 5.0
+    assert block_tree.decode_passes <= 5
+    assert block_tree.compile_count == 0
 
 
-def test_qwen3_dflash_tp2_sharding_and_zero_captured_constants_subprocess(tmp_path: Path) -> None:
-    target_dir, draft_dir = _build_qwen3_and_dflash_dirs(tmp_path)
+def test_qwen3_block_tree_tp2_sharding_and_zero_captured_constants_subprocess(tmp_path: Path) -> None:
+    target_dir, draft_dir = _build_qwen3_and_block_drafter_dirs(tmp_path)
     repo_root = Path(__file__).resolve().parent.parent
     script = f"""
 import json
-from benchmarks.dflash_jax import load_qwen_dflash_runner
+from benchmarks.block_diffusion_jax import (
+    BlockDiffusionConfig,
+    load_qwen_block_tree_runner,
+)
 
-runner, _, _ = load_qwen_dflash_runner(
+runner, _, _ = load_qwen_block_tree_runner(
     {str(target_dir)!r},
     {str(draft_dir)!r},
     max_seq_len=512,
@@ -417,9 +435,10 @@ runner, _, _ = load_qwen_dflash_runner(
 )
 runner.warmup()
 prompt = [0, 1, 2, 3, 4, 5, 6, 7, 8]
-res = runner.run_dflash_tree(prompt, max_new_tokens=21)
+res = runner.run_block_tree(prompt, max_new_tokens=21)
 assert runner.tp_size == 2
-print(json.dumps({{"tokens": res.token_ids, "tok_per_pass": res.mean_tokens_per_decode_pass, "compiles": res.compile_count}}))
+assert res.mode == "tpuforge_block_tree"
+print(json.dumps({{"mode": res.mode, "tokens": res.token_ids, "tok_per_pass": res.mean_tokens_per_decode_pass, "compiles": res.compile_count}}))
 """
     env = dict(os.environ)
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=2").strip()

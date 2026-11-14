@@ -61,8 +61,8 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
   - `ops/`: Systolic-aligned matrix operations and attention verification kernels.
   - `speculative/`: Speculative decoding coordination and exact-token verification.
   - `runtime/`: PJRT loader and HLO execution pipeline.
-- `benchmarks/`: Microbenchmarks and JAX/XLA runners (`qwen_jax.py`, `dflash_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
-- `tests/`: Unit, C++/nanobind, XLA sharding, DFlash, and ring-attention test suites (`pytest`).
+- `benchmarks/`: Microbenchmarks and JAX/XLA runners (`qwen_jax.py`, `block_diffusion_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
+- `tests/`: Unit, C++/nanobind, XLA sharding, hybrid block-tree, and ring-attention test suites (`pytest`).
 - `docs/`: Architecture and TRC grant proposal notes (`docs/TRC_APPLICATION.md`).
 
 ---
@@ -71,7 +71,7 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 | Hardware Target | Status | Focus Area |
 | :--- | :--- | :--- |
-| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, `O(1)` `SuffixIndex`, DFlash tree packing, OpenXLA GSPMD TP parity, `36/36` pytest |
+| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, `O(1)` `SuffixIndex`, hybrid block-tree packing, OpenXLA GSPMD TP parity, `36/36` pytest |
 | **Kaggle Free TPU `v5e-8` (128 GB HBM)** | Ready | 8x16 GB pooled HBM, Megatron TP (`7B` auto, `32B` `TP=8`), streaming loader |
 | **Cloud TPU `v5e` / `v6e` (Trillium)** | Verified (v5e-1) / Ready (v6e) | Auto `128x128` (v5e) or `256x256` (v6e/v7) MXU via `infer_mxu_dim` |
 | **Cloud TPU `v7` / `8x` Series** | Supported | Native `256x256` systolic tile parameterization |
@@ -105,7 +105,7 @@ pytest -q
 # Run Vanilla JAX vs StaticArena (M-002) vs TPUForge Tree (M-003) on Qwen2.5 or Qwen3
 python -m benchmarks.run_qwen_bench --model Qwen/Qwen2.5-Coder-0.5B-Instruct --tile-size auto --tp-size auto
 
-# Run Hybrid Block-Diffusion (DFlash) + O(1) Suffix Tree Speculative Verification on Qwen3
+# Run Hybrid Block-Diffusion + O(1) Suffix Systolic Tree Speculative Verification (`tpuforge_block_tree`, compatible with Z Lab DFlash HF checkpoints)
 python -m benchmarks.run_qwen_bench --model Qwen/Qwen3-4B --draft-model z-lab/Qwen3-4B-DFlash-b16 --tile-size auto --tp-size auto
 
 # Run M-005 Optical Torus Ring-Attention (ppermute prefill + stationary-KV systolic tree decode via IciRingPlanner)
@@ -117,7 +117,7 @@ python -m benchmarks.package_kaggle_bundle
 
 ### Key Runtime Optimizations
 - **O(1) Incremental `SuffixIndex`:** Replaces `O(128 * ctx_len)` per-step scans with an incremental 1-to-4-gram hash table in C++ (`SuffixIndex`) for sub-millisecond `32K+` context drafting.
-- **Hybrid Block-Diffusion (`DFlash`) + Suffix Tree Packing:** Packs parallel `DFlash` draft logits (`top-k` per block slot) with `SuffixIndex` continuations via `TreeBuilder::build_from_block_top_k` into `128`- or `256`-row systolic verification tiles (`ForgeEngine(..., draft_tree_fn=...)`).
+- **Hybrid Block-Diffusion + O(1) Suffix Systolic Tree Drafting (`tpuforge_block_tree`):** Implemented in `block_diffusion_jax.py` (`QwenBlockTreeRunner`, `TreeBuilder::build_from_block_top_k`, `ForgeEngine(..., draft_tree_fn=...)`); packs parallel block-drafter `top-k` candidates with `SuffixIndex` continuations into `128`- or `256`-row systolic verification tiles, with support for compatible public Hugging Face block-diffusion (`dflash_config`) checkpoints.
 - **Cold-Start Elimination:** Configures persistent OpenXLA compilation caching (`TPUFORGE_XLA_CACHE_DIR` / `configure_xla_compilation_cache`), persistent `mmap` handles (`_MappedSafetensorsReader`), and concurrent target+draft hub downloads.
 
 ### Running Native CLI on TPU via PJRT
