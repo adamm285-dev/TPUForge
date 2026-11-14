@@ -71,7 +71,7 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 | Hardware Target | Status | Focus Area |
 | :--- | :--- | :--- |
-| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, OpenXLA GSPMD TP parity, 31/31 pytest |
+| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, OpenXLA GSPMD TP parity, 32/32 pytest |
 | **Kaggle Free TPU `v5e-8` (128 GB HBM)** | Ready | 8x16 GB pooled HBM, Megatron TP (`7B` auto, `32B` `TP=8`), streaming loader |
 | **Cloud TPU `v5e` / `v6e` (Trillium)** | Verified (v5e-1) / Ready (v6e) | Auto `128x128` (v5e) or `256x256` (v6e/v7) MXU via `infer_mxu_dim` |
 | **Cloud TPU `v7` / `8x` Series** | Supported | Native `256x256` systolic tile parameterization |
@@ -80,8 +80,8 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 | Benchmark / Model | Configuration | Measured Silicon Results |
 | :--- | :--- | :--- |
-| **Qwen2.5-Coder-7B-Instruct** (`M-002`, `M-003`) | `tile=128`, `TP=1`, `max_seq=1024`, `gen=64` | Prompt sweep: `1` vs `5` compiles (`1.667s` vs `3.916s`, **`2.35x` faster**; `0.350s` vs `2.743s` = **`7.83x`** on lengths `64..195`). Code refactor: **`115.27 tok/s`** vs `49.18 tok/s` Vanilla JAX (**`2.34x` decode speedup**, **`4.05x` total speedup** `0.636s` vs `2.575s`, **`4.57` tok/pass**, `64/64` exact greedy parity). |
-| **Qwen2.5-Coder-3B-Instruct** (`M-002`, `M-003`) | `tile=128` vs `tile=256`, `TP=1`, `max_seq=2048`, `gen=128` | Prompt sweep (`tile=128`): `1` vs `5` compiles (`1.304s` vs `3.269s`, **`2.51x` faster**). Code refactor: **`97.22 tok/s`** (`1.395s` vs `2.263s` total = **`1.62x`**, `3.88` tok/pass, `128/128` parity) at hardware-matched `tile=128` vs `48.81 tok/s` at `tile=256` (**`1.99x` faster** via `infer_mxu_dim`). |
+| **Qwen2.5-Coder-7B-Instruct** (`M-002`, `M-003`) | `tile=128`, `TP=1`, `max_seq=1024`, `gen=64` | Prompt sweep: `1` vs `5` compiles (`1.633s` vs `3.869s`, **`2.37x` faster**; `0.347s` vs `2.679s` = **`7.72x`** on lengths `64..195`). Code refactor: **`202.80 tok/s`** vs `49.25 tok/s` Vanilla JAX (**`4.12x` decode speedup**, **`7.50x` total speedup** `0.358s` vs `2.685s`, **`4.57` tok/pass**, `64/64` exact greedy parity; `22.54 ms` tree step vs `20.63 ms` 1-token Vanilla step via on-device argmax). Cold codegen: **`62.38 tok/s`** vs `49.30 tok/s` (**`1.27x` decode**, **`1.84x` total**, `64/64` parity). |
+| **Qwen2.5-Coder-3B-Instruct** (`M-002`, `M-003`) | `tile=128` vs `tile=256`, `TP=1`, `max_seq=2048`, `gen=128` | Prompt sweep (`tile=128`): `1` vs `5` compiles (`1.215s` vs `3.342s`, **`2.75x` faster**; `0.180s` vs `2.273s` = **`12.60x`** on lengths `64..195`). Code refactor: **`328.79 tok/s`** vs `94.88 tok/s` Vanilla JAX (**`3.47x` decode speedup**, **`5.68x` total speedup** `0.411s` vs `2.334s`, **`3.88` tok/pass**, `128/128` parity; `11.80 ms` tree step vs `10.62 ms` Vanilla step) vs **`268.39 tok/s`** at `tile=256` (**`1.23x` faster** via hardware-matched `infer_mxu_dim`). Cold codegen: **`119.80 tok/s`** vs `95.13 tok/s` (**`1.26x` decode**, **`1.79x` total**, `128/128` parity). |
 | **M-005 Blockwise Flash-Ring** (`M-005`) | `tile=128`, `ring=1`, `TP=1`, BF16 | `3584/4096` parity: **`2,680,640 tok/s`** prefill (`1.337 ms`), **`0.353 ms`** tree step (`362,752` tree-nodes/s, `3.91e-03` / `1.22e-04` max abs err). `28672/32768` (`1.75 GiB` KV): **`519,735 tok/s`** prefill (`55.167 ms`), **`1.032 ms`** tree step (`124,047` tree-nodes/s, `collective-permute` HLO verified). |
 
 ---
