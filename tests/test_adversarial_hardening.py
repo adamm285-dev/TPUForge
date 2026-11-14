@@ -7,10 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import _tpuforge_ext as tpu
 import numpy as np
 import pytest
-
-import _tpuforge_ext as tpu
 from conftest import find_pjrt_test_plugin
 
 
@@ -228,5 +227,6 @@ def test_clean_environment_pyd_import_without_msys64_on_path():
         capture_output=True,
         text=True,
         timeout=20,
+        check=False,
     )
     assert proc.returncode == 0, f"Standalone _tpuforge_ext import failed without MSYS64 PATH:\n{proc.stderr}"

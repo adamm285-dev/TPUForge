@@ -90,6 +90,7 @@ def test_ring_attention_four_chip_hlo_and_parity_subprocess(tmp_path: Path) -> N
 
     with zipfile.ZipFile(out_zip, "r") as zf:
         assert "benchmarks/ring_attention_jax.py" in zf.namelist()
+        assert "tests/fixtures/pjrt_test_plugin.c" in zf.namelist()
 
     repo_root = Path(__file__).resolve().parent.parent
     script = r"""
@@ -242,6 +243,48 @@ assert bench_res.hlo_has_collective_permute is True
 assert bench_res.kv_bytes_per_rank * 4 == bench_res.kv_cluster_bytes
 assert bench_res.prefill_max_abs_err is not None and bench_res.prefill_max_abs_err < 1e-4
 assert bench_res.tree_max_abs_err is not None and bench_res.tree_max_abs_err < 1e-4
+
+# 3) Multi-block flash-ring tiling (chunk_len=640 -> block=320, 2x2 tiles with partial tail)
+multi_res = run_ring_benchmark(
+    max_seq_len=2560,
+    valid_seq_len=1900,
+    ring_size=4,
+    tp_size=1,
+    tile_size=128,
+    num_layers=2,
+    num_q_heads=8,
+    num_kv_heads=2,
+    head_dim=16,
+    warmup=1,
+    iters=1,
+    check_parity=True,
+    dtype_name="float32",
+)
+assert multi_res.hlo_has_collective_permute is True
+assert multi_res.prefill_max_abs_err is not None and multi_res.prefill_max_abs_err < 1e-4
+assert multi_res.tree_max_abs_err is not None and multi_res.tree_max_abs_err < 1e-4
+
+# 4) Native BF16 MXU accumulation parity (no NaN/Inf, matches _gqa_attention within 2e-2)
+bf16_res = run_ring_benchmark(
+    max_seq_len=2560,
+    valid_seq_len=1900,
+    ring_size=4,
+    tp_size=1,
+    tile_size=128,
+    num_layers=2,
+    num_q_heads=8,
+    num_kv_heads=2,
+    head_dim=16,
+    warmup=1,
+    iters=1,
+    check_parity=True,
+    dtype_name="bfloat16",
+)
+assert bf16_res.hlo_has_collective_permute is True
+assert bf16_res.prefill_max_abs_err is not None
+assert not np.isnan(bf16_res.prefill_max_abs_err) and bf16_res.prefill_max_abs_err < 2e-2
+assert bf16_res.tree_max_abs_err is not None
+assert not np.isnan(bf16_res.tree_max_abs_err) and bf16_res.tree_max_abs_err < 2e-2
 """
     env = dict(os.environ)
     env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
@@ -257,7 +300,7 @@ assert bench_res.tree_max_abs_err is not None and bench_res.tree_max_abs_err < 1
         env=env,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
         check=False,
     )
     assert proc.returncode == 0, f"4-chip ring subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"

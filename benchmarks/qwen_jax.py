@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import math
 import mmap
 import os
-from pathlib import Path
 import struct
 import sys
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import ml_dtypes
 import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 # Ensure build/ and MSYS2 UCRT64 runtime DLLs are discoverable for _tpuforge_ext
 _ROOT = Path(__file__).resolve().parent.parent
@@ -29,7 +31,7 @@ if sys.platform == "win32":
     if _UCRT_BIN.is_dir():
         os.add_dll_directory(str(_UCRT_BIN))
 
-import _tpuforge_ext as tpu  # noqa: E402
+import _tpuforge_ext as tpu
 
 TILE_SIZE = 128
 VALID_TILE_SIZES = (128, 256)
@@ -39,7 +41,7 @@ _MASK_BLOCK_VAL = -1e9
 def resolve_tile_size(tile_size: int | str = "auto") -> int:
     """Resolve systolic tile width (128 for v2..v5e/CPU, 256 for v6e Trillium/v7/TPU 8x)."""
     if isinstance(tile_size, bool):
-        raise ValueError("tile_size cannot be bool; expected 'auto', 128, or 256")
+        raise ValueError("tile_size cannot be bool; expected 'auto', 128, or 256")  # noqa: TRY004
     if isinstance(tile_size, str):
         norm = tile_size.strip().lower()
         if norm == "auto":
@@ -61,14 +63,14 @@ def resolve_tile_size(tile_size: int | str = "auto") -> int:
 
 def resolve_tp_mesh(
     tp_size: int | str = "auto",
-    config: "QwenConfig | None" = None,
+    config: QwenConfig | None = None,
 ) -> tuple[int, Mesh | None]:
     """Resolve Megatron Tensor Parallelism degree and build a 1D ('tp',) JAX Mesh."""
     devs = jax.devices()
     num_devs = len(devs)
 
     if isinstance(tp_size, bool):
-        raise ValueError("tp_size cannot be bool")
+        raise ValueError("tp_size cannot be bool")  # noqa: TRY004
 
     if isinstance(tp_size, str):
         norm = tp_size.strip().lower()
@@ -97,17 +99,20 @@ def resolve_tp_mesh(
         raise ValueError(
             f"Requested tp_size={resolved_tp}, but only {num_devs} JAX device(s) are visible"
         )
-    if config is not None and resolved_tp > 1:
-        if (
+    if (
+        config is not None
+        and resolved_tp > 1
+        and (
             config.num_attention_heads % resolved_tp != 0
             or config.num_key_value_heads % resolved_tp != 0
             or config.intermediate_size % resolved_tp != 0
-        ):
-            raise ValueError(
-                f"tp_size={resolved_tp} must evenly divide num_attention_heads="
-                f"{config.num_attention_heads}, num_key_value_heads={config.num_key_value_heads}, "
-                f"and intermediate_size={config.intermediate_size}"
-            )
+        )
+    ):
+        raise ValueError(
+            f"tp_size={resolved_tp} must evenly divide num_attention_heads="
+            f"{config.num_attention_heads}, num_key_value_heads={config.num_key_value_heads}, "
+            f"and intermediate_size={config.intermediate_size}"
+        )
     if resolved_tp == 1:
         return 1, None
     mesh = Mesh(np.array(devs[:resolved_tp]), axis_names=("tp",))
@@ -144,7 +149,7 @@ class QwenConfig:
     eos_token_ids: tuple[int, ...] = (151645, 151643)
 
     @classmethod
-    def from_dir(cls, model_dir: Path) -> "QwenConfig":
+    def from_dir(cls, model_dir: Path) -> QwenConfig:
         cfg_path = model_dir / "config.json"
         if not cfg_path.is_file():
             raise FileNotFoundError(f"Missing config.json in {model_dir}")
@@ -377,7 +382,7 @@ class QwenWeights:
         config: QwenConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
-    ) -> "QwenWeights":
+    ) -> QwenWeights:
         np_dtype = _jnp_to_numpy_dtype(dtype)
         tp_size = mesh.size if mesh is not None else 1
 
@@ -395,12 +400,12 @@ class QwenWeights:
                 shards.append(jax.device_put(jnp.asarray(part, dtype=np_dtype), dev))
             return jax.make_array_from_single_device_arrays(full_np.shape, sharding, shards)
 
-        def to_jnp(arr: np.ndarray, transpose: bool = False, spec: P = P()) -> jax.Array:
+        def to_jnp(arr: np.ndarray, transpose: bool = False, spec: P | None = None) -> jax.Array:
             if transpose:
                 arr = np.ascontiguousarray(arr.T)
-            return place_sharded_from_host(arr, spec)
+            return place_sharded_from_host(arr, P() if spec is None else spec)
 
-        def stack_layer(suffix: str, transpose: bool = False, spec: P = P()) -> jax.Array:
+        def stack_layer(suffix: str, transpose: bool = False, spec: P | None = None) -> jax.Array:
             items = []
             for i in range(config.num_hidden_layers):
                 key = f"model.layers.{i}.{suffix}"
@@ -410,7 +415,7 @@ class QwenWeights:
                 if transpose:
                     arr = np.ascontiguousarray(arr.T)
                 items.append(arr)
-            return place_sharded_from_host(np.stack(items, axis=0), spec)
+            return place_sharded_from_host(np.stack(items, axis=0), P() if spec is None else spec)
 
         lm_spec = P(None, "tp") if (tp_size > 1 and config.vocab_size % tp_size == 0) else P()
         embed_np = raw["model.embed_tokens.weight"]
@@ -449,7 +454,7 @@ class QwenWeights:
         config: QwenConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
-    ) -> "QwenWeights":
+    ) -> QwenWeights:
         """Stream tensors shard-by-shard from disk directly onto TPU HBM with low host RAM."""
         tensor_loc = _iter_safetensors_index(model_dir)
         np_dtype = _jnp_to_numpy_dtype(dtype)
@@ -646,16 +651,42 @@ def _gqa_attention(
     """Compute Grouped-Query Attention for query [S, H_q, D] against [M, H_kv, D]."""
     seq_q = q.shape[0]
     num_groups = num_q_heads // num_kv_heads
+    scale = 1.0 / math.sqrt(float(head_dim))
+    if q.dtype in (jnp.bfloat16, jnp.float16):
+        # Single-pass native BF16/FP16 MXU accumulation into FP32 avoids multi-pass emulation.
+        q_grouped = q.reshape(seq_q, num_kv_heads, num_groups, head_dim)
+        scores = (
+            jnp.einsum(
+                "skgd,mkd->kgsm",
+                q_grouped,
+                k_all,
+                preferred_element_type=jnp.float32,
+            )
+            * scale
+        )
+        scores = scores + mask_sm[None, None, :, :]
+        probs = jax.nn.softmax(scores, axis=-1).astype(v_all.dtype)
+        ctx = jnp.einsum(
+            "kgsm,mkd->skgd",
+            probs,
+            v_all,
+            preferred_element_type=jnp.float32,
+        )
+        return ctx.reshape(seq_q, num_q_heads * head_dim).astype(q.dtype)
+
     q_grouped = q.reshape(seq_q, num_kv_heads, num_groups, head_dim).astype(jnp.float32)
     k_f32 = k_all.astype(jnp.float32)
     v_f32 = v_all.astype(jnp.float32)
 
-    scores = jnp.einsum(
-        "skgd,mkd->kgsm",
-        q_grouped,
-        k_f32,
-        precision=jax.lax.Precision.HIGHEST,
-    ) * (1.0 / math.sqrt(float(head_dim)))
+    scores = (
+        jnp.einsum(
+            "skgd,mkd->kgsm",
+            q_grouped,
+            k_f32,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        * scale
+    )
     scores = scores + mask_sm[None, None, :, :]
     probs = jax.nn.softmax(scores, axis=-1)
     ctx = jnp.einsum(
@@ -667,11 +698,22 @@ def _gqa_attention(
     return ctx.reshape(seq_q, num_q_heads * head_dim).astype(q.dtype)
 
 
-def _linear(x: jax.Array, w: jax.Array, b: jax.Array | None = None) -> jax.Array:
+def _linear(
+    x: jax.Array,
+    w: jax.Array,
+    b: jax.Array | None = None,
+    out_dtype: Any | None = None,
+) -> jax.Array:
+    target_dtype = x.dtype if out_dtype is None else out_dtype
+    if x.dtype in (jnp.bfloat16, jnp.float16):
+        out = jnp.matmul(x, w, preferred_element_type=jnp.float32)
+        if b is not None:
+            out = out + b.astype(jnp.float32)
+        return out.astype(target_dtype)
     out = jnp.matmul(x, w, precision=jax.lax.Precision.HIGHEST)
     if b is not None:
         out = out + b
-    return out
+    return out.astype(target_dtype) if out.dtype != target_dtype else out
 
 
 def _qwen_qkv_proj(
@@ -810,6 +852,25 @@ class QwenBenchmarkRunner:
         kv_head_sharding = self.kv_head_sharding
         kv_cache_sharding = self.kv_cache_sharding
 
+        self._weights_tuple: tuple[jax.Array, ...] = (
+            w.embed,
+            w.final_norm,
+            w.lm_head,
+            w.in_norm,
+            w.post_norm,
+            w.wq,
+            w.bq,
+            w.wk,
+            w.bk,
+            w.wv,
+            w.bv,
+            w.wo,
+            w.w_gate,
+            w.w_up,
+            w.w_down,
+        )
+        del w
+
         def _empty_kv_cache() -> tuple[jax.Array, jax.Array]:
             shape = (cfg.num_hidden_layers, max_seq + 1, num_kv, head_dim)
             if kv_cache_sharding is not None:
@@ -821,34 +882,18 @@ class QwenBenchmarkRunner:
 
         self._empty_kv_cache = _empty_kv_cache
 
-        def _layer_tuple(k_cache: jax.Array, v_cache: jax.Array) -> tuple[jax.Array, ...]:
-            return (
-                w.in_norm,
-                w.post_norm,
-                w.wq,
-                w.bq,
-                w.wk,
-                w.bk,
-                w.wv,
-                w.bv,
-                w.wo,
-                w.w_gate,
-                w.w_up,
-                w.w_down,
-                k_cache,
-                v_cache,
-            )
-
         @jax.jit
         def vanilla_prefill_jit(
+            wt: tuple[jax.Array, ...],
             prompt_ids: jax.Array,
             k_cache: jax.Array,
             v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             self.vanilla_prefill_compile_count += 1
+            embed, final_norm, lm_head, *layer_weights = wt
             seq_p = prompt_ids.shape[0]
             positions = jnp.arange(seq_p, dtype=jnp.int32)
-            x0 = w.embed[prompt_ids]
+            x0 = embed[prompt_ids]
             if rep_sharding is not None:
                 x0 = jax.lax.with_sharding_constraint(x0, rep_sharding)
             causal = jnp.where(
@@ -871,22 +916,24 @@ class QwenBenchmarkRunner:
                 )
                 return _qwen_block_post_attn(x, attn_out, lw, cfg, rep_sharding), (kc, vc)
 
-            x_final, (k_out, v_out) = jax.lax.scan(body, x0, _layer_tuple(k_cache, v_cache))
-            last_h = _rms_norm(x_final[-1:], w.final_norm, cfg.rms_norm_eps)
-            logits = _linear(last_h, w.lm_head).astype(jnp.float32)[0]
+            x_final, (k_out, v_out) = jax.lax.scan(body, x0, (*layer_weights, k_cache, v_cache))
+            last_h = _rms_norm(x_final[-1:], final_norm, cfg.rms_norm_eps)
+            logits = _linear(last_h, lm_head, out_dtype=jnp.float32)[0]
             if rep_sharding is not None:
                 logits = jax.lax.with_sharding_constraint(logits, rep_sharding)
             return logits, k_out, v_out
 
         @jax.jit
         def vanilla_decode_step_jit(
+            wt: tuple[jax.Array, ...],
             token_id: jax.Array,
             pos: jax.Array,
             k_cache: jax.Array,
             v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             self.vanilla_decode_compile_count += 1
-            x0 = w.embed[token_id].reshape(1, cfg.hidden_size)
+            embed, final_norm, lm_head, *layer_weights = wt
+            x0 = embed[token_id].reshape(1, cfg.hidden_size)
             if rep_sharding is not None:
                 x0 = jax.lax.with_sharding_constraint(x0, rep_sharding)
             pos_arr = jnp.asarray([pos], dtype=jnp.int32)
@@ -910,15 +957,16 @@ class QwenBenchmarkRunner:
                 )
                 return _qwen_block_post_attn(x, attn_out, lw, cfg, rep_sharding), (kc, vc)
 
-            x_final, (k_out, v_out) = jax.lax.scan(body, x0, _layer_tuple(k_cache, v_cache))
-            last_h = _rms_norm(x_final, w.final_norm, cfg.rms_norm_eps)
-            logits = _linear(last_h, w.lm_head).astype(jnp.float32)[0]
+            x_final, (k_out, v_out) = jax.lax.scan(body, x0, (*layer_weights, k_cache, v_cache))
+            last_h = _rms_norm(x_final, final_norm, cfg.rms_norm_eps)
+            logits = _linear(last_h, lm_head, out_dtype=jnp.float32)[0]
             if rep_sharding is not None:
                 logits = jax.lax.with_sharding_constraint(logits, rep_sharding)
             return logits, k_out, v_out
 
         @jax.jit
         def static_systolic_tile_step_jit(
+            wt: tuple[jax.Array, ...],
             valid_prefix_len: jax.Array,
             token_tile: jax.Array,
             pos_tile: jax.Array,
@@ -927,7 +975,8 @@ class QwenBenchmarkRunner:
             v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             self.static_step_compile_count += 1
-            x0 = w.embed[token_tile]
+            embed, final_norm, lm_head, *layer_weights = wt
+            x0 = embed[token_tile]
             if rep_sharding is not None:
                 x0 = jax.lax.with_sharding_constraint(x0, rep_sharding)
             prefix_allowed = jnp.where(
@@ -953,10 +1002,10 @@ class QwenBenchmarkRunner:
                 return _qwen_block_post_attn(x, attn_out, lw, cfg, rep_sharding), (k_step, v_step)
 
             x_final, (step_k_out, step_v_out) = jax.lax.scan(
-                body, x0, _layer_tuple(k_cache, v_cache)
+                body, x0, (*layer_weights, k_cache, v_cache)
             )
-            normed = _rms_norm(x_final, w.final_norm, cfg.rms_norm_eps)
-            logits_tile = _linear(normed, w.lm_head).astype(jnp.float32)
+            normed = _rms_norm(x_final, final_norm, cfg.rms_norm_eps)
+            logits_tile = _linear(normed, lm_head, out_dtype=jnp.float32)
             if rep_sharding is not None:
                 logits_tile = jax.lax.with_sharding_constraint(logits_tile, rep_sharding)
             return logits_tile, step_k_out, step_v_out
@@ -1020,7 +1069,9 @@ class QwenBenchmarkRunner:
 
         t0 = time.perf_counter()
         prompt_arr = self._put_rep(prompt_tokens, dtype=jnp.int32)
-        logits, k_cache, v_cache = self._vanilla_prefill_jit(prompt_arr, k_cache, v_cache)
+        logits, k_cache, v_cache = self._vanilla_prefill_jit(
+            self._weights_tuple, prompt_arr, k_cache, v_cache
+        )
         next_tok = int(jnp.argmax(logits))
         jax.block_until_ready((logits, k_cache, v_cache))
         t1 = time.perf_counter()
@@ -1033,6 +1084,7 @@ class QwenBenchmarkRunner:
             cur_pos = len(prompt_tokens)
             while len(generated) < max_new_tokens:
                 logits, k_cache, v_cache = self._vanilla_decode_step_jit(
+                    self._weights_tuple,
                     self._put_rep(next_tok, dtype=jnp.int32),
                     self._put_rep(cur_pos, dtype=jnp.int32),
                     k_cache,
@@ -1109,6 +1161,7 @@ class QwenBenchmarkRunner:
                 mask_np[r, r] = 0.0
 
             _, step_k, step_v = self._static_systolic_tile_step_jit(
+                self._weights_tuple,
                 self._put_rep(offset, dtype=jnp.int32),
                 self._put_rep(tok_np),
                 self._put_rep(pos_np),
@@ -1150,6 +1203,7 @@ class QwenBenchmarkRunner:
             pos_np[0] = cur_prefix
 
             logits_tile, step_k, step_v = self._static_systolic_tile_step_jit(
+                self._weights_tuple,
                 self._put_rep(cur_prefix, dtype=jnp.int32),
                 self._put_rep(tok_np),
                 self._put_rep(pos_np),
@@ -1242,6 +1296,7 @@ class QwenBenchmarkRunner:
             mask_tile: np.ndarray,
         ) -> np.ndarray:
             logits_tile, step_k, step_v = self._static_systolic_tile_step_jit(
+                self._weights_tuple,
                 self._put_rep(valid_prefix_len, dtype=jnp.int32),
                 self._put_rep(tok_tile),
                 self._put_rep(pos_tile),

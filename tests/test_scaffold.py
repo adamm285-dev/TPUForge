@@ -63,6 +63,7 @@ def test_native_clang_build_and_bench_execution():
             env=env,
             capture_output=True,
             text=True,
+            check=False,
         )
         assert cfg.returncode == 0, f"CMake configure failed:\n{cfg.stderr}"
 
@@ -72,6 +73,7 @@ def test_native_clang_build_and_bench_execution():
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert bld.returncode == 0, f"CMake build failed:\n{bld.stderr}"
 
@@ -85,6 +87,7 @@ def test_native_clang_build_and_bench_execution():
         env=env,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert run.returncode == 0, f"Binary execution failed:\n{run.stderr}"
     assert "MXU systolic layout: 128x128" in run.stdout

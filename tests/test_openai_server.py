@@ -6,21 +6,19 @@ import concurrent.futures
 import http.client
 import json
 import math
-from pathlib import Path
 import socket
 import subprocess
 import sys
 import threading
 import time
-import numpy as np
-import pytest
-
-import jax
-import jax.numpy as jnp
+from pathlib import Path
 
 import _tpuforge_ext as tpu
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
 from conftest import find_pjrt_test_plugin
-
 
 VOCAB_SIZE = 264
 D_MODEL = 128
@@ -670,7 +668,7 @@ def test_openai_server_wave5_slowloris_rng_gil_and_cli_regressions():
     sse_unblocked_by_client = [False]
 
     def custom_step_fn(valid_prefix_len, token_tile, pos_tile, mask_tile):
-        active_tokens = set(int(x) for x in token_tile)
+        active_tokens = {int(x) for x in token_tile}
         # M4 trigger: exclamation mark byte (4 + 33 = 37) deterministically fires on prefill tile
         if 37 in active_tokens:
             raise RuntimeError("boom from python callback")
@@ -882,6 +880,7 @@ def test_openai_server_wave5_slowloris_rng_gil_and_cli_regressions():
         cwd=str(root),
         capture_output=True,
         text=True,
+        check=False,
     )
     assert missing_prog.returncode != 0
 

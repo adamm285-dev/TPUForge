@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import struct
 import subprocess
 import sys
 import zipfile
+from pathlib import Path
 
+import _tpuforge_ext as tpu
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
 
-import _tpuforge_ext as tpu
 from benchmarks.package_kaggle_bundle import build_kaggle_bundle
 from benchmarks.qwen_jax import (
     QwenBenchmarkRunner,
@@ -233,7 +233,7 @@ def test_forge_engine_configurable_eos_token_ids() -> None:
     bad_req = tpu.GenerationRequest()
     bad_req.prompt_tokens = [10, 20, 30]
     bad_req.eos_token_ids = [999]
-    with pytest.raises(Exception):
+    with pytest.raises(IndexError, match="eos_token_id out of"):
         engine.generate(bad_req)
 
 
@@ -315,10 +315,13 @@ def test_qwen_tp_sharding_parity_subprocess() -> None:
         "prompt = [10, 11, 12, 13] * 12 + [10]\n"
         "kc2, vc2 = r2._empty_kv_cache()\n"
         "hlo = r2._static_systolic_tile_step_jit.lower("
+        "r2._weights_tuple, "
         "r2._put_rep(0, jnp.int32), r2._put_rep([0]*128, jnp.int32), "
         "r2._put_rep([0]*128, jnp.int32), r2._put_rep(jnp.zeros((128, 128), jnp.float32)), "
         "kc2, vc2).compile().as_text()\n"
         "assert 'all-reduce(' in hlo, 'Expected Megatron TP all-reduce in HLO'\n"
+        "mv = r1.run_vanilla_jax(prompt, max_new_tokens=4)\n"
+        "assert len(mv.token_ids) == 4\n"
         "m1 = r1.run_static_arena(prompt, max_new_tokens=16)\n"
         "m2 = r2.run_static_arena(prompt, max_new_tokens=16)\n"
         "m2_tree = r2.run_tpuforge_tree(prompt, max_new_tokens=16)\n"
@@ -327,6 +330,7 @@ def test_qwen_tp_sharding_parity_subprocess() -> None:
     )
     env = dict(os.environ)
     env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+    env["JAX_CAPTURED_CONSTANTS_WARN_BYTES"] = "1024"
     py_paths = [str(repo_root), str(repo_root / "tests")]
     venv_site = repo_root / ".venv" / "Lib" / "site-packages"
     if venv_site.is_dir():
@@ -336,11 +340,13 @@ def test_qwen_tp_sharding_parity_subprocess() -> None:
         [sys.executable, "-c", script],
         cwd=str(repo_root),
         env=env,
+        check=False,
         capture_output=True,
         text=True,
         timeout=120,
     )
     assert proc.returncode == 0, f"TP=2 subprocess failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "constants were captured during lowering" not in proc.stderr, proc.stderr
 
 
 def test_kaggle_bundle_packaging(tmp_path: Path) -> None:
@@ -365,3 +371,28 @@ def test_kaggle_bundle_packaging(tmp_path: Path) -> None:
         assert not any(n.endswith((".exe", ".dll", ".pyd", ".so", ".zip")) for n in names)
         nb = json.loads(zf.read("colab/TPUForge_Benchmark.ipynb").decode("utf-8"))
         assert nb["nbformat"] == 4 and len(nb["cells"]) >= 4
+
+
+def test_qwen_bfloat16_native_mxu_parity() -> None:
+    """Verify native BF16 MXU accumulation keeps 3-mode parity across Vanilla, StaticArena, and Tree."""
+    cfg, raw = _make_cyclic_qwen_model()
+    weights = QwenWeights.from_numpy_dict(raw, cfg, dtype=jnp.bfloat16)
+    assert weights.wq.dtype == jnp.bfloat16
+
+    runner = QwenBenchmarkRunner(
+        config=cfg,
+        weights=weights,
+        tokenizer=None,
+        max_seq_len=512,
+        tile_size=128,
+    )
+    prompt = [10, 11, 12, 13] * 12 + [10]
+    m_vanilla = runner.run_vanilla_jax(prompt, max_new_tokens=16)
+    m_static = runner.run_static_arena(prompt, max_new_tokens=16)
+    m_tree = runner.run_tpuforge_tree(prompt, max_new_tokens=16)
+
+    expected = [11, 12, 13, 10] * 4
+    assert m_vanilla.token_ids == expected
+    assert m_static.token_ids == expected
+    assert m_tree.token_ids == expected
+    assert m_tree.mean_tokens_per_decode_pass > 2.0

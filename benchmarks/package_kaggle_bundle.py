@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import zipfile
+from pathlib import Path
 
 DEFAULT_INCLUDE_PATHS = (
     "CMakeLists.txt",
@@ -17,6 +17,7 @@ DEFAULT_INCLUDE_PATHS = (
     "benchmarks/run_qwen_bench.py",
     "benchmarks/package_kaggle_bundle.py",
     "benchmarks/__init__.py",
+    "tests/fixtures/pjrt_test_plugin.c",
     "colab/TPUForge_Benchmark.ipynb",
 )
 

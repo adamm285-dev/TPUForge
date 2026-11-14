@@ -45,7 +45,8 @@ target_include_directories(tpuforge_core PUBLIC
 )
 
 if(UNIX)
-    target_link_libraries(tpuforge_core PUBLIC ${CMAKE_DL_LIBS})
+    find_package(Threads REQUIRED)
+    target_link_libraries(tpuforge_core PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 elseif(WIN32)
     target_link_libraries(tpuforge_core PUBLIC ws2_32)
 endif()
@@ -61,16 +62,18 @@ if(MINGW)
     target_link_options(tpuforge_bench PRIVATE -static)
 endif()
 
-# Test PJRT C ABI plugin shared library
-add_library(pjrt_test_plugin SHARED
-    tests/fixtures/pjrt_test_plugin.c
-)
-set_target_properties(pjrt_test_plugin PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-)
-if(MINGW)
-    target_link_options(pjrt_test_plugin PRIVATE -static)
+# Test PJRT C ABI plugin shared library (optional when packaging minimal bundles)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/pjrt_test_plugin.c")
+    add_library(pjrt_test_plugin SHARED
+        tests/fixtures/pjrt_test_plugin.c
+    )
+    set_target_properties(pjrt_test_plugin PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
+    if(MINGW)
+        target_link_options(pjrt_test_plugin PRIVATE -static)
+    endif()
 endif()
 
 # Optional nanobind Python extension

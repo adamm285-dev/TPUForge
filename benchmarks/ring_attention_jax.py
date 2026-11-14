@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -94,6 +96,33 @@ def build_ici_ring_plan(
     return tpu.IciRingPlanner.plan(cfg, int(ring_size))
 
 
+def _pick_block_size(length: int, target: int = 512) -> int:
+    """Return the largest integer <= min(length, target) that evenly divides length."""
+    if length <= 0 or target <= 0:
+        raise ValueError(f"length ({length}) and target ({target}) must be positive")
+    cap = min(length, target)
+    for candidate in range(cap, 0, -1):
+        if length % candidate == 0:
+            return candidate
+    return 1
+
+
+def _make_shard_map(fn: Any, *, mesh: Mesh, in_specs: Any, out_specs: Any) -> Any:
+    """Create a version-portable shard_map across JAX 0.4.25 through 0.12+."""
+    smap = getattr(jax, "shard_map", None)
+    if smap is None:
+        from jax.experimental.shard_map import shard_map as exp_smap
+
+        smap = exp_smap
+    params = inspect.signature(smap).parameters
+    extra_kwargs: dict[str, Any] = {}
+    if "check_vma" in params:
+        extra_kwargs["check_vma"] = False
+    elif "check_rep" in params:
+        extra_kwargs["check_rep"] = False
+    return smap(fn, mesh=mesh, in_specs=in_specs, out_specs=out_specs, **extra_kwargs)
+
+
 def _online_softmax_block_update(
     m: jax.Array,
     l: jax.Array,
@@ -106,17 +135,23 @@ def _online_softmax_block_update(
     additive_bias: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Numerically stable online log-sum-exp softmax update over one KV ring block."""
+    compute_prec = (
+        jax.lax.Precision.HIGHEST
+        if q_grouped.dtype == jnp.float32
+        else jax.lax.Precision.DEFAULT
+    )
     scores = (
         jnp.einsum(
             "qkgd,nkd->kgqn",
             q_grouped,
             k_block,
-            precision=jax.lax.Precision.HIGHEST,
+            precision=compute_prec,
+            preferred_element_type=jnp.float32,
         )
         * scale
     )
     if additive_bias is not None:
-        scores = scores + additive_bias[None, None, :, :]
+        scores = scores + additive_bias[None, None, :, :].astype(jnp.float32)
     scores = jnp.where(valid_mask[None, None, :, :], scores, -jnp.inf)
 
     block_max = jnp.max(scores, axis=-1)
@@ -127,11 +162,17 @@ def _online_softmax_block_update(
     probs_unnorm = jnp.exp(scores - m_safe[..., None])
 
     l_new = alpha * l + jnp.sum(probs_unnorm, axis=-1)
+    probs_cast = (
+        probs_unnorm
+        if v_block.dtype == jnp.float32
+        else probs_unnorm.astype(v_block.dtype)
+    )
     acc_new = alpha[..., None] * acc + jnp.einsum(
         "kgqn,nkd->kgqd",
-        probs_unnorm,
+        probs_cast,
         v_block,
-        precision=jax.lax.Precision.HIGHEST,
+        precision=compute_prec,
+        preferred_element_type=jnp.float32,
     )
     return m_cand, l_new, acc_new
 
@@ -162,7 +203,7 @@ def make_ring_causal_attention_kernel(
     head_dim: int,
     page_size: int = 1,
 ):
-    """Compile a JAX shard_map + ppermute Ring-Attention causal prefill kernel."""
+    """Compile a blockwise Flash JAX shard_map + ppermute Ring-Attention causal prefill kernel."""
     ring_size = int(mesh.shape["ring"])
     tp_size = int(mesh.shape["tp"])
     if num_q_heads % tp_size != 0 or num_kv_heads % tp_size != 0:
@@ -189,6 +230,11 @@ def make_ring_causal_attention_kernel(
         page_size=page_size,
     )
     perm = [(int(s), int(d)) for s, d in plan.send_perm]
+    chunk_len = max_seq_len // ring_size
+    q_blk = _pick_block_size(chunk_len, 512)
+    kv_blk = _pick_block_size(chunk_len, 512)
+    num_q_blks = chunk_len // q_blk
+    num_kv_blks = chunk_len // kv_blk
 
     def _per_shard(
         q_chunk: jax.Array,
@@ -196,39 +242,99 @@ def make_ring_causal_attention_kernel(
         v_chunk: jax.Array,
         valid_seq_len: jax.Array,
     ) -> jax.Array:
-        chunk_len = q_chunk.shape[0]
         r = jax.lax.axis_index("ring")
-        local_idx = jnp.arange(chunk_len, dtype=jnp.int32)
-        q_pos = r * chunk_len + local_idx
-        q_valid = q_pos < valid_seq_len
-
-        q_grouped = q_chunk.reshape(chunk_len, num_kv_local, num_groups, head_dim).astype(
-            jnp.float32
+        q_local_idx = jnp.arange(q_blk, dtype=jnp.int32)
+        kv_local_idx = jnp.arange(kv_blk, dtype=jnp.int32)
+        qb_indices = jnp.arange(num_q_blks, dtype=jnp.int32)
+        q_blocks = q_chunk.reshape(
+            num_q_blks, q_blk, num_kv_local, num_groups, head_dim
         )
-        k_f32 = k_chunk.astype(jnp.float32)
-        v_f32 = v_chunk.astype(jnp.float32)
 
-        m0 = jnp.full((num_kv_local, num_groups, chunk_len), -jnp.inf, dtype=jnp.float32)
-        l0 = jnp.zeros((num_kv_local, num_groups, chunk_len), dtype=jnp.float32)
+        m0 = jnp.full(
+            (num_q_blks, num_kv_local, num_groups, q_blk), -jnp.inf, dtype=jnp.float32
+        )
+        l0 = jnp.zeros(
+            (num_q_blks, num_kv_local, num_groups, q_blk), dtype=jnp.float32
+        )
         acc0 = jnp.zeros(
-            (num_kv_local, num_groups, chunk_len, head_dim), dtype=jnp.float32
+            (num_q_blks, num_kv_local, num_groups, q_blk, head_dim), dtype=jnp.float32
         )
+
+        def _apply_kv_chunk(
+            m_all: jax.Array,
+            l_all: jax.Array,
+            acc_all: jax.Array,
+            k_curr: jax.Array,
+            v_curr: jax.Array,
+            kv_rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            k_blocks = k_curr.reshape(num_kv_blks, kv_blk, num_kv_local, head_dim)
+            v_blocks = v_curr.reshape(num_kv_blks, kv_blk, num_kv_local, head_dim)
+            q_chunk_start = r * chunk_len
+            kv_chunk_start = kv_rank * chunk_len
+
+            def q_block_step(
+                _carry: None,
+                item: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+            ) -> tuple[None, tuple[jax.Array, jax.Array, jax.Array]]:
+                q_b, m_b, l_b, acc_b, qb = item
+                q_base = q_chunk_start + qb * q_blk
+                q_pos = q_base + q_local_idx
+                q_valid = q_pos < valid_seq_len
+                q_max_pos = jnp.minimum(q_base + q_blk, valid_seq_len) - 1
+
+                def kv_block_body(
+                    kvb: jax.Array,
+                    state: tuple[jax.Array, jax.Array, jax.Array],
+                ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                    m_s, l_s, acc_s = state
+                    kv_base = kv_chunk_start + kvb * kv_blk
+                    tile_active = (
+                        (q_base < valid_seq_len)
+                        & (kv_base < valid_seq_len)
+                        & (kv_base <= q_max_pos)
+                    )
+
+                    def do_tile(
+                        st: tuple[jax.Array, jax.Array, jax.Array],
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                        m_cur, l_cur, acc_cur = st
+                        k_pos = kv_base + kv_local_idx
+                        valid_mask = (
+                            (q_pos[:, None] >= k_pos[None, :])
+                            & q_valid[:, None]
+                            & (k_pos[None, :] < valid_seq_len)
+                        )
+                        return _online_softmax_block_update(
+                            m_cur,
+                            l_cur,
+                            acc_cur,
+                            q_b,
+                            k_blocks[kvb],
+                            v_blocks[kvb],
+                            valid_mask,
+                            scale,
+                        )
+
+                    return jax.lax.cond(
+                        tile_active, do_tile, lambda st: st, (m_s, l_s, acc_s)
+                    )
+
+                m_out, l_out, acc_out = jax.lax.fori_loop(
+                    0, num_kv_blks, kv_block_body, (m_b, l_b, acc_b)
+                )
+                return None, (m_out, l_out, acc_out)
+
+            _, (m_new, l_new, acc_new) = jax.lax.scan(
+                q_block_step, None, (q_blocks, m_all, l_all, acc_all, qb_indices)
+            )
+            return m_new, l_new, acc_new
 
         if ring_size == 1:
-            k_pos = local_idx
-            valid_mask = (
-                (q_pos[:, None] >= k_pos[None, :])
-                & q_valid[:, None]
-                & (k_pos[None, :] < valid_seq_len)
-            )
-            _, l_fin, acc_fin = _online_softmax_block_update(
-                m0, l0, acc0, q_grouped, k_f32, v_f32, valid_mask, scale
+            _, l_fin, acc_fin = _apply_kv_chunk(
+                m0, l0, acc0, k_chunk, v_chunk, jnp.asarray(0, dtype=jnp.int32)
             )
         else:
-            m0 = jax.lax.pcast(m0, ("ring", "tp"), to="varying")
-            l0 = jax.lax.pcast(l0, ("ring", "tp"), to="varying")
-            acc0 = jax.lax.pcast(acc0, ("ring", "tp"), to="varying")
-
             def hop_body(
                 step: jax.Array,
                 carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
@@ -237,27 +343,37 @@ def make_ring_causal_attention_kernel(
                 k_next = jax.lax.ppermute(k_curr, "ring", perm)
                 v_next = jax.lax.ppermute(v_curr, "ring", perm)
                 kv_rank = jnp.mod(r + ring_size - step, ring_size)
-                k_pos = kv_rank * chunk_len + local_idx
-                valid_mask = (
-                    (q_pos[:, None] >= k_pos[None, :])
-                    & q_valid[:, None]
-                    & (k_pos[None, :] < valid_seq_len)
+                q_start = r * chunk_len
+                kv_start = kv_rank * chunk_len
+                q_chunk_max = jnp.minimum(q_start + chunk_len, valid_seq_len) - 1
+                chunk_active = (
+                    (q_start < valid_seq_len)
+                    & (kv_start < valid_seq_len)
+                    & (kv_start <= q_chunk_max)
                 )
-                m_next, l_next, acc_next = _online_softmax_block_update(
-                    m_curr, l_curr, acc_curr, q_grouped, k_curr, v_curr, valid_mask, scale
+                m_next, l_next, acc_next = jax.lax.cond(
+                    chunk_active,
+                    lambda st: _apply_kv_chunk(
+                        st[0], st[1], st[2], k_curr, v_curr, kv_rank
+                    ),
+                    lambda st: st,
+                    (m_curr, l_curr, acc_curr),
                 )
                 return (k_next, v_next, m_next, l_next, acc_next)
 
             _, _, _, l_fin, acc_fin = jax.lax.fori_loop(
-                0, ring_size, hop_body, (k_f32, v_f32, m0, l0, acc0)
+                0, ring_size, hop_body, (k_chunk, v_chunk, m0, l0, acc0)
             )
 
         out = acc_fin / jnp.where(l_fin > 0.0, l_fin, 1.0)[..., None]
-        out = jnp.transpose(out, (2, 0, 1, 3)).reshape(chunk_len, num_q_local, head_dim)
-        out = jnp.where(q_valid[:, None, None], out, 0.0)
+        out = jnp.transpose(out, (0, 3, 1, 2, 4)).reshape(
+            chunk_len, num_q_local, head_dim
+        )
+        q_pos_all = r * chunk_len + jnp.arange(chunk_len, dtype=jnp.int32)
+        out = jnp.where((q_pos_all < valid_seq_len)[:, None, None], out, 0.0)
         return out.astype(q_chunk.dtype)
 
-    mapped = jax.shard_map(
+    mapped = _make_shard_map(
         _per_shard,
         mesh=mesh,
         in_specs=(
@@ -309,6 +425,9 @@ def make_ring_systolic_tree_attention_kernel(
         page_size=page_size,
     )
     perm = [(int(s), int(d)) for s, d in plan.send_perm]
+    chunk_len = max_seq_len // ring_size
+    kv_blk = _pick_block_size(chunk_len, 1024)
+    num_kv_blks = chunk_len // kv_blk
 
     def _per_shard(
         q_tile: jax.Array,
@@ -319,31 +438,51 @@ def make_ring_systolic_tree_attention_kernel(
         tile_mask: jax.Array,
         valid_prefix_len: jax.Array,
     ) -> jax.Array:
-        chunk_len = k_prefix.shape[0]
         r = jax.lax.axis_index("ring")
-        k_pos = r * chunk_len + jnp.arange(chunk_len, dtype=jnp.int32)
-        valid_pref = jnp.broadcast_to(
-            (k_pos < valid_prefix_len)[None, :], (tile_size, chunk_len)
-        )
+        kv_local_idx = jnp.arange(kv_blk, dtype=jnp.int32)
+        q_grouped = q_tile.reshape(tile_size, num_kv_local, num_groups, head_dim)
+        k_pref_blocks = k_prefix.reshape(num_kv_blks, kv_blk, num_kv_local, head_dim)
+        v_pref_blocks = v_prefix.reshape(num_kv_blks, kv_blk, num_kv_local, head_dim)
 
-        q_grouped = q_tile.reshape(tile_size, num_kv_local, num_groups, head_dim).astype(
-            jnp.float32
-        )
         m0 = jnp.full((num_kv_local, num_groups, tile_size), -jnp.inf, dtype=jnp.float32)
         l0 = jnp.zeros((num_kv_local, num_groups, tile_size), dtype=jnp.float32)
         acc0 = jnp.zeros(
             (num_kv_local, num_groups, tile_size, head_dim), dtype=jnp.float32
         )
 
-        m_loc, l_loc, acc_loc = _online_softmax_block_update(
-            m0,
-            l0,
-            acc0,
-            q_grouped,
-            k_prefix.astype(jnp.float32),
-            v_prefix.astype(jnp.float32),
-            valid_pref,
-            scale,
+        def pref_kv_body(
+            kvb: jax.Array,
+            state: tuple[jax.Array, jax.Array, jax.Array],
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            m_s, l_s, acc_s = state
+            kv_base = r * chunk_len + kvb * kv_blk
+            block_active = kv_base < valid_prefix_len
+
+            def do_pref_blk(
+                st: tuple[jax.Array, jax.Array, jax.Array],
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                m_cur, l_cur, acc_cur = st
+                k_pos = kv_base + kv_local_idx
+                valid_pref = jnp.broadcast_to(
+                    (k_pos < valid_prefix_len)[None, :], (tile_size, kv_blk)
+                )
+                return _online_softmax_block_update(
+                    m_cur,
+                    l_cur,
+                    acc_cur,
+                    q_grouped,
+                    k_pref_blocks[kvb],
+                    v_pref_blocks[kvb],
+                    valid_pref,
+                    scale,
+                )
+
+            return jax.lax.cond(
+                block_active, do_pref_blk, lambda st: st, (m_s, l_s, acc_s)
+            )
+
+        m_loc, l_loc, acc_loc = jax.lax.fori_loop(
+            0, num_kv_blks, pref_kv_body, (m0, l0, acc0)
         )
 
         if ring_size == 1:
@@ -389,8 +528,8 @@ def make_ring_systolic_tree_attention_kernel(
             l_pref,
             acc_pref,
             q_grouped,
-            k_step.astype(jnp.float32),
-            v_step.astype(jnp.float32),
+            k_step,
+            v_step,
             valid_tile,
             scale,
             additive_bias=additive_bias,
@@ -399,7 +538,7 @@ def make_ring_systolic_tree_attention_kernel(
         out = jnp.transpose(out, (2, 0, 1, 3)).reshape(tile_size, num_q_local, head_dim)
         return out.astype(q_tile.dtype)
 
-    mapped = jax.shard_map(
+    mapped = _make_shard_map(
         _per_shard,
         mesh=mesh,
         in_specs=(
@@ -412,7 +551,6 @@ def make_ring_systolic_tree_attention_kernel(
             P(),
         ),
         out_specs=P(None, "tp", None),
-        check_vma=False,
     )
     return jax.jit(mapped)
 
@@ -506,32 +644,26 @@ def run_ring_benchmark(
     tile_q_sharding = NamedSharding(mesh, P(None, "tp", None))
     rep_sharding = NamedSharding(mesh, P())
 
-    q_pref = jax.device_put(
-        (jax.random.normal(k1, (max_seq_len, num_q_heads, head_dim)) * 0.25).astype(dtype),
-        seq_kv_sharding,
+    scale_val = jnp.asarray(0.25, dtype=dtype)
+
+    def _init_sharded(rng_key: jax.Array, shape: tuple[int, int, int]) -> jax.Array:
+        return jax.random.normal(rng_key, shape, dtype=dtype) * scale_val
+
+    init_seq_fn = jax.jit(
+        _init_sharded, static_argnums=(1,), out_shardings=seq_kv_sharding
     )
-    k_pref = jax.device_put(
-        (jax.random.normal(k2, (max_seq_len, num_kv_heads, head_dim)) * 0.25).astype(dtype),
-        seq_kv_sharding,
+    init_tile_fn = jax.jit(
+        _init_sharded, static_argnums=(1,), out_shardings=tile_q_sharding
     )
-    v_pref = jax.device_put(
-        (jax.random.normal(k3, (max_seq_len, num_kv_heads, head_dim)) * 0.25).astype(dtype),
-        seq_kv_sharding,
-    )
+
+    q_pref = init_seq_fn(k1, (max_seq_len, num_q_heads, head_dim))
+    k_pref = init_seq_fn(k2, (max_seq_len, num_kv_heads, head_dim))
+    v_pref = init_seq_fn(k3, (max_seq_len, num_kv_heads, head_dim))
     valid_arr = jax.device_put(jnp.asarray(valid_seq_len, dtype=jnp.int32), rep_sharding)
 
-    q_tile = jax.device_put(
-        (jax.random.normal(k4, (resolved_tile, num_q_heads, head_dim)) * 0.25).astype(dtype),
-        tile_q_sharding,
-    )
-    k_step = jax.device_put(
-        (jax.random.normal(k5, (resolved_tile, num_kv_heads, head_dim)) * 0.25).astype(dtype),
-        tile_q_sharding,
-    )
-    v_step = jax.device_put(
-        (jax.random.normal(k6, (resolved_tile, num_kv_heads, head_dim)) * 0.25).astype(dtype),
-        tile_q_sharding,
-    )
+    q_tile = init_tile_fn(k4, (resolved_tile, num_q_heads, head_dim))
+    k_step = init_tile_fn(k5, (resolved_tile, num_kv_heads, head_dim))
+    v_step = init_tile_fn(k6, (resolved_tile, num_kv_heads, head_dim))
 
     draft_ctx = [100 + (i % 13) for i in range(64)]
     tree = tpu.SuffixTreeDrafter.build_tree(

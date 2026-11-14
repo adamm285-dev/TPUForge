@@ -71,10 +71,18 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 | Hardware Target | Status | Focus Area |
 | :--- | :--- | :--- |
-| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, OpenXLA GSPMD TP parity, 28/28 pytest |
+| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, OpenXLA GSPMD TP parity, 31/31 pytest |
 | **Kaggle Free TPU `v5e-8` (128 GB HBM)** | Ready | 8x16 GB pooled HBM, Megatron TP (`7B` auto, `32B` `TP=8`), streaming loader |
-| **Cloud TPU `v5e` / `v6e` (Trillium)** | Target | Auto `128x128` (v5e) or `256x256` (v6e/v7) MXU via `infer_mxu_dim` |
+| **Cloud TPU `v5e` / `v6e` (Trillium)** | Verified (v5e-1) / Ready (v6e) | Auto `128x128` (v5e) or `256x256` (v6e/v7) MXU via `infer_mxu_dim` |
 | **Cloud TPU `v7` / `8x` Series** | Supported | Native `256x256` systolic tile parameterization |
+
+### Verified Cloud TPU Silicon Telemetry (`TPU v5 lite` / `v5e-1`, `15.75 GiB` HBM, `JAX 0.11.2`, BF16)
+
+| Benchmark / Model | Configuration | Measured Silicon Results |
+| :--- | :--- | :--- |
+| **Qwen2.5-Coder-7B-Instruct** (`M-002`, `M-003`) | `tile=128`, `TP=1`, `max_seq=1024`, `gen=64` | Prompt sweep: `1` vs `5` compiles (`1.667s` vs `3.916s`, **`2.35x` faster**; `0.350s` vs `2.743s` = **`7.83x`** on lengths `64..195`). Code refactor: **`115.27 tok/s`** vs `49.18 tok/s` Vanilla JAX (**`2.34x` decode speedup**, **`4.05x` total speedup** `0.636s` vs `2.575s`, **`4.57` tok/pass**, `64/64` exact greedy parity). |
+| **Qwen2.5-Coder-3B-Instruct** (`M-002`, `M-003`) | `tile=128` vs `tile=256`, `TP=1`, `max_seq=2048`, `gen=128` | Prompt sweep (`tile=128`): `1` vs `5` compiles (`1.304s` vs `3.269s`, **`2.51x` faster**). Code refactor: **`97.22 tok/s`** (`1.395s` vs `2.263s` total = **`1.62x`**, `3.88` tok/pass, `128/128` parity) at hardware-matched `tile=128` vs `48.81 tok/s` at `tile=256` (**`1.99x` faster** via `infer_mxu_dim`). |
+| **M-005 Blockwise Flash-Ring** (`M-005`) | `tile=128`, `ring=1`, `TP=1`, BF16 | `3584/4096` parity: **`2,680,640 tok/s`** prefill (`1.337 ms`), **`0.353 ms`** tree step (`362,752` tree-nodes/s, `3.91e-03` / `1.22e-04` max abs err). `28672/32768` (`1.75 GiB` KV): **`519,735 tok/s`** prefill (`55.167 ms`), **`1.032 ms`** tree step (`124,047` tree-nodes/s, `collective-permute` HLO verified). |
 
 ---
 

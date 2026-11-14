@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
-from pathlib import Path
 import time
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -124,15 +124,27 @@ def run_benchmark_suite(
     output_json: Path | None = None,
     tile_size: int | str = "auto",
     tp_size: int | str = "auto",
+    preloaded: tuple[QwenBenchmarkRunner, Path] | None = None,
 ) -> dict[str, Any]:
     t_load0 = time.perf_counter()
-    base_runner, model_dir = load_qwen_runner(
-        model_id_or_path=model_id,
-        max_seq_len=max_seq_len,
-        dtype_name=dtype_name,
-        tile_size=tile_size,
-        tp_size=tp_size,
-    )
+    if preloaded is not None:
+        prev_runner, model_dir = preloaded
+        base_runner = QwenBenchmarkRunner(
+            config=prev_runner.config,
+            weights=prev_runner.weights,
+            tokenizer=prev_runner.tokenizer,
+            max_seq_len=max_seq_len,
+            tile_size=tile_size,
+            mesh=prev_runner.mesh,
+        )
+    else:
+        base_runner, model_dir = load_qwen_runner(
+            model_id_or_path=model_id,
+            max_seq_len=max_seq_len,
+            dtype_name=dtype_name,
+            tile_size=tile_size,
+            tp_size=tp_size,
+        )
     load_s = time.perf_counter() - t_load0
 
     backend = jax.default_backend()
@@ -154,15 +166,8 @@ def run_benchmark_suite(
         )
     print("=" * 78)
 
-    # Workload 1: Cold prompt-shape sweep on a fresh runner (measures compile_count & compile+prefill)
-    sweep_runner = QwenBenchmarkRunner(
-        config=base_runner.config,
-        weights=base_runner.weights,
-        tokenizer=base_runner.tokenizer,
-        max_seq_len=max_seq_len,
-        tile_size=base_runner.tile_size,
-        mesh=base_runner.mesh,
-    )
+    # Reuse base_runner directly (zero prior compilations, avoids duplicate runner instantiation).
+    sweep_runner = base_runner
     sweep_prompts = _make_sweep_prompts(base_runner.tokenizer)
     w1_vanilla: list[dict[str, Any]] = []
     w1_static: list[dict[str, Any]] = []

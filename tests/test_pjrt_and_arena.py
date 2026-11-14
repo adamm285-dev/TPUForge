@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import _tpuforge_ext as tpu
 import numpy as np
 import pytest
-
-import _tpuforge_ext as tpu
 from conftest import find_pjrt_test_plugin
 
 

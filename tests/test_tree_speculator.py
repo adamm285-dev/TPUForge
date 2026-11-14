@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import math
-import numpy as np
-import pytest
-
-import jax
-import jax.numpy as jnp
 
 import _tpuforge_ext as tpu
+import jax
+import jax.numpy as jnp
+import numpy as np
 
 VOCAB_SIZE = 32
 D_MODEL = 128
@@ -205,7 +203,6 @@ def test_openxla_tree_speculation_bit_exact_and_zero_recompile():
     for arena in layer_arenas:
         assert arena.is_aligned_128()
 
-    prompt0 = prompts[0]
     gen_len = 48
 
     # --- 1. Ground-truth Serial Autoregressive Baselines across all 3 prompts ---
@@ -319,7 +316,7 @@ def test_openxla_tree_speculation_bit_exact_and_zero_recompile():
             f"Parity mismatch on prompt {p_idx}:\ntree:   {tree_tokens_i}\nserial: {expected_serial}"
         )
 
-    tree_tokens, tree_passes = all_prompt_results[0]
+    _tree_tokens, tree_passes = all_prompt_results[0]
     assert len(set(serial_baselines[0])) >= 6, f"Expected diverse induction sequence, got {serial_baselines[0]}"
     assert tree_passes == 10, f"Expected deterministic 10 tree forward passes for {gen_len} tokens, got {tree_passes}"
     assert systolic_compile_count[0] == 1, f"Expected 1 JAX JIT compilation, got {systolic_compile_count[0]}"
