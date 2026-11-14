@@ -15,6 +15,7 @@ DEFAULT_INCLUDE_PATHS = (
     "benchmarks/qwen_jax.py",
     "benchmarks/quantization_jax.py",
     "benchmarks/moe_streaming_jax.py",
+    "benchmarks/ast_seed_jax.py",
     "benchmarks/block_diffusion_jax.py",
     "benchmarks/ring_attention_jax.py",
     "benchmarks/run_qwen_bench.py",

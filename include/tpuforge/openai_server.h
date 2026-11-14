@@ -74,6 +74,7 @@ struct GenerationRequest {
     std::vector<ChatMessage> messages;
     std::vector<int32_t> prompt_tokens;
     std::vector<int32_t> eos_token_ids;
+    std::vector<std::vector<int32_t>> seed_token_sequences;
     size_t max_tokens{64};
     float temperature{0.0f};
     std::optional<uint64_t> seed;
@@ -161,6 +162,12 @@ public:
     // Validates request bounds and resolves prompt token IDs before locking or streaming headers.
     std::vector<int32_t> validate_request(const GenerationRequest& req) const;
 
+    // Seeds out-of-band AST/syntax transition n-grams shared across requests without touching prompt history.
+    void seed_ast_sequences(const std::vector<std::vector<int32_t>>& sequences);
+    void seed_ast_text(const std::vector<std::string>& snippets);
+    void clear_ast_seeds();
+    size_t ast_seed_tokens() const;
+
     // Runs prefill + 128-node systolic speculative decoding under internal mutex serialization.
     GenerationResult generate(
         const GenerationRequest& req,
@@ -187,6 +194,7 @@ private:
     DraftTreeFn draft_tree_fn_;
     std::vector<float> pjrt_step_k_;
     std::vector<float> pjrt_step_v_;
+    SuffixIndex base_seed_index_;
     mutable std::mutex engine_mu_;
 };
 

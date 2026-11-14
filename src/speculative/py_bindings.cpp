@@ -265,6 +265,15 @@ NB_MODULE(_tpuforge_ext, m) {
                 idx.append_tokens(tokens.data(), tokens.shape(0));
             },
             nb::arg("tokens").noconvert())
+        .def("seed_tokens",
+            [](tpuforge::SuffixIndex& idx,
+               nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> tokens) {
+                idx.seed_tokens(tokens.data(), tokens.shape(0));
+            },
+            nb::arg("tokens").noconvert())
+        .def("seed_sequence", &tpuforge::SuffixIndex::seed_sequence, nb::arg("sequence"))
+        .def("seed_sequences", &tpuforge::SuffixIndex::seed_sequences, nb::arg("sequences"))
+        .def("seeded_tokens", &tpuforge::SuffixIndex::seeded_tokens)
         .def("query", &tpuforge::SuffixIndex::query,
              nb::arg("path_after_root"), nb::arg("top_k") = 3)
         .def("build_tree", &tpuforge::SuffixIndex::build_tree,
@@ -526,6 +535,7 @@ NB_MODULE(_tpuforge_ext, m) {
         .def_rw("messages", &tpuforge::GenerationRequest::messages)
         .def_rw("prompt_tokens", &tpuforge::GenerationRequest::prompt_tokens)
         .def_rw("eos_token_ids", &tpuforge::GenerationRequest::eos_token_ids)
+        .def_rw("seed_token_sequences", &tpuforge::GenerationRequest::seed_token_sequences)
         .def_rw("max_tokens", &tpuforge::GenerationRequest::max_tokens)
         .def_rw("temperature", &tpuforge::GenerationRequest::temperature)
         .def_rw("seed", &tpuforge::GenerationRequest::seed)
@@ -778,7 +788,11 @@ NB_MODULE(_tpuforge_ext, m) {
         .def("model_id", &tpuforge::ForgeEngine::model_id)
         .def("config", &tpuforge::ForgeEngine::config)
         .def("tokenizer", &tpuforge::ForgeEngine::tokenizer)
-        .def("compile_count", &tpuforge::ForgeEngine::compile_count);
+        .def("compile_count", &tpuforge::ForgeEngine::compile_count)
+        .def("seed_ast_sequences", &tpuforge::ForgeEngine::seed_ast_sequences, nb::arg("sequences"))
+        .def("seed_ast_text", &tpuforge::ForgeEngine::seed_ast_text, nb::arg("snippets"))
+        .def("clear_ast_seeds", &tpuforge::ForgeEngine::clear_ast_seeds)
+        .def("ast_seed_tokens", &tpuforge::ForgeEngine::ast_seed_tokens);
 
     nb::class_<tpuforge::OpenAIServer::Config>(m, "OpenAIServerConfig")
         .def(nb::init<>())

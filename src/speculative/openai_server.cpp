@@ -51,6 +51,8 @@ constexpr size_t kMaxHttpHeaderBytes = 16384;
 constexpr size_t kMaxHttpBodyBytes = 1048576; // 1 MiB
 constexpr size_t kMaxJsonDepth = 32;
 constexpr size_t kMaxTokensPerRequest = 4096;
+constexpr size_t kMaxSeedTokensPerRequest = 131072;
+constexpr size_t kMaxSeedSnippetsPerRequest = 256;
 
 uint64_t splitmix64(uint64_t x) noexcept {
     x += 0x9E3779B97F4A7C15ULL;
@@ -1061,6 +1063,48 @@ size_t ForgeEngine::compile_count() const {
     return executor_ ? executor_->compile_count() : 0;
 }
 
+void ForgeEngine::seed_ast_sequences(const std::vector<std::vector<int32_t>>& sequences) {
+    size_t total_tokens = 0;
+    for (const auto& seq : sequences) {
+        if (seq.size() > kMaxSeedTokensPerRequest - total_tokens) {
+            throw std::invalid_argument(
+                "AST seed tokens exceed maximum allowed budget (" +
+                std::to_string(kMaxSeedTokensPerRequest) + ")"
+            );
+        }
+        total_tokens += seq.size();
+        for (int32_t tok : seq) {
+            if (tok < 0 || static_cast<size_t>(tok) >= config_.vocab_size) {
+                throw std::out_of_range("AST seed token ID out of [0, vocab_size) bounds");
+            }
+        }
+    }
+    std::scoped_lock lk(engine_mu_);
+    base_seed_index_.seed_sequences(sequences);
+}
+
+void ForgeEngine::seed_ast_text(const std::vector<std::string>& snippets) {
+    std::vector<std::vector<int32_t>> sequences;
+    sequences.reserve(snippets.size());
+    for (const auto& s : snippets) {
+        auto encoded = tokenizer_.encode(s, false, false);
+        if (encoded.size() >= 2) {
+            sequences.push_back(std::move(encoded));
+        }
+    }
+    seed_ast_sequences(sequences);
+}
+
+void ForgeEngine::clear_ast_seeds() {
+    std::scoped_lock lk(engine_mu_);
+    base_seed_index_.reset({});
+}
+
+size_t ForgeEngine::ast_seed_tokens() const {
+    std::scoped_lock lk(engine_mu_);
+    return base_seed_index_.seeded_tokens();
+}
+
 std::vector<int32_t> ForgeEngine::validate_request(const GenerationRequest& req) const {
     if (!std::isfinite(req.temperature) || req.temperature < 0.0f || req.temperature > 2.0f) {
         throw std::invalid_argument("temperature must be a finite float in [0.0, 2.0]");
@@ -1096,6 +1140,21 @@ std::vector<int32_t> ForgeEngine::validate_request(const GenerationRequest& req)
     for (int32_t eos_id : req.eos_token_ids) {
         if (eos_id < 0 || static_cast<size_t>(eos_id) >= config_.vocab_size) {
             throw std::out_of_range("eos_token_id out of [0, vocab_size) bounds");
+        }
+    }
+    size_t total_seed_tokens = 0;
+    for (const auto& seq : req.seed_token_sequences) {
+        if (seq.size() > kMaxSeedTokensPerRequest - total_seed_tokens) {
+            throw std::invalid_argument(
+                "Request seed_token_sequences exceeds maximum allowed budget (" +
+                std::to_string(kMaxSeedTokensPerRequest) + ")"
+            );
+        }
+        total_seed_tokens += seq.size();
+        for (int32_t tok : seq) {
+            if (tok < 0 || static_cast<size_t>(tok) >= config_.vocab_size) {
+                throw std::out_of_range("seed_token_sequences token ID out of [0, vocab_size) bounds");
+            }
         }
     }
     return prompt;
@@ -1216,7 +1275,11 @@ GenerationResult ForgeEngine::generate(
                req.eos_token_ids.end();
     };
 
-    SuffixIndex suffix_index(history);
+    SuffixIndex suffix_index = base_seed_index_;
+    if (!req.seed_token_sequences.empty()) {
+        suffix_index.seed_sequences(req.seed_token_sequences);
+    }
+    suffix_index.append_tokens(history.data(), history.size());
 
     while (generated.size() < req.max_tokens &&
            static_cast<size_t>(arena_.valid_prefix_len()) < max_prefix) {
@@ -1838,6 +1901,39 @@ struct OpenAIServer::Impl {
                     return;
                 }
                 gen_req.ignore_eos = ignore_eos_v->bool_val;
+            }
+        }
+
+        if (const JsonValue* seeds_v = root.find("seed_snippets")) {
+            if (seeds_v->kind != JsonValue::Kind::Null) {
+                if (seeds_v->kind != JsonValue::Kind::Array) {
+                    (void)send_json_error(sock, 400, "'seed_snippets' must be an array of strings");
+                    return;
+                }
+                if (seeds_v->arr_val.size() > kMaxSeedSnippetsPerRequest) {
+                    (void)send_json_error(
+                        sock,
+                        400,
+                        "'seed_snippets' exceeds maximum allowed count (" +
+                            std::to_string(kMaxSeedSnippetsPerRequest) + ")"
+                    );
+                    return;
+                }
+                gen_req.seed_token_sequences.reserve(seeds_v->arr_val.size());
+                for (const auto& item : seeds_v->arr_val) {
+                    if (item.kind != JsonValue::Kind::String) {
+                        (void)send_json_error(sock, 400, "Each element in 'seed_snippets' must be a string");
+                        return;
+                    }
+                    if (!is_valid_utf8(item.str_val)) {
+                        (void)send_json_error(sock, 400, "Each element in 'seed_snippets' must be valid UTF-8");
+                        return;
+                    }
+                    auto encoded = engine.tokenizer().encode(item.str_val, false, false);
+                    if (encoded.size() >= 2) {
+                        gen_req.seed_token_sequences.push_back(std::move(encoded));
+                    }
+                }
             }
         }
 

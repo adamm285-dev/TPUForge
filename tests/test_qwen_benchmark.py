@@ -364,6 +364,7 @@ def test_kaggle_bundle_packaging(tmp_path: Path) -> None:
             "src/main.cpp",
             "benchmarks/quantization_jax.py",
             "benchmarks/moe_streaming_jax.py",
+            "benchmarks/ast_seed_jax.py",
             "benchmarks/qwen_jax.py",
             "benchmarks/block_diffusion_jax.py",
             "benchmarks/run_qwen_bench.py",

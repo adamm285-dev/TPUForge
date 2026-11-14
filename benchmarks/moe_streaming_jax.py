@@ -8,7 +8,7 @@ import json
 import math
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple, Self
@@ -1555,6 +1555,7 @@ class MoeStreamingRunner:
         prompt_tokens: list[int],
         max_new_tokens: int,
         eos_token_ids: Iterable[int] | None = None,
+        seed_token_sequences: Sequence[Sequence[int]] | None = None,
     ) -> RunMetrics:
         """M-002 + M-003 + M-008: amortize host expert H2D transfers across 128/256 tree nodes."""
         self._validate_bounds(prompt_tokens, max_new_tokens)
@@ -1656,9 +1657,16 @@ class MoeStreamingRunner:
             prefill_step_fn=prefill_step_fn,
             greedy_step_fn=greedy_step_fn,
         )
+        seed_seqs = (
+            [[int(t) for t in seq] for seq in seed_token_sequences if len(seq) >= 2]
+            if seed_token_sequences is not None
+            else []
+        )
         req = tpu.GenerationRequest()
         req.prompt_tokens = list(prompt_tokens)
         req.eos_token_ids = eos_list
+        if seed_seqs:
+            req.seed_token_sequences = seed_seqs
         req.max_tokens = int(max_new_tokens)
         req.temperature = 0.0
 
@@ -1673,6 +1681,8 @@ class MoeStreamingRunner:
         prefill_s = t_split - t_all0
         decode_s = t_all1 - t_split
         gen_len = len(token_ids)
+        extra = self._extra_metrics(stats, gen_len)
+        extra["ast_seed_tokens"] = sum(len(seq) for seq in seed_seqs)
         return RunMetrics(
             mode="tpuforge_tree_moe",
             token_ids=token_ids,
@@ -1688,7 +1698,7 @@ class MoeStreamingRunner:
             decode_passes=int(res.decode_forward_passes),
             draft_tokens_accepted=int(res.draft_tokens_accepted),
             mean_tokens_per_decode_pass=float(res.mean_tokens_per_decode_pass),
-            extra=self._extra_metrics(stats, gen_len),
+            extra=extra,
         )
 
 

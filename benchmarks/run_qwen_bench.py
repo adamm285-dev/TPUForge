@@ -11,6 +11,7 @@ from typing import Any
 
 import jax
 
+from benchmarks.ast_seed_jax import encode_with_tokenizer, extract_repo_ast_snippets
 from benchmarks.block_diffusion_jax import (
     BlockDiffusionConfig,
     BlockDiffusionWeights,
@@ -178,6 +179,7 @@ def run_benchmark_suite(
     draft_model_id: str | None = None,
     top_k: int = 8,
     weight_quant: str = "none",
+    ast_seed_path: str | Path | None = None,
 ) -> dict[str, Any]:
     normalized_draft = draft_model_id.strip() if draft_model_id else ""
     block_runner: QwenBlockTreeRunner | None = None
@@ -318,11 +320,24 @@ def run_benchmark_suite(
         )
     print(f"  Sample output ({w2_runs[-1].mode}):\n{w2_runs[-1].text[:320]}")
 
+    ast_seed_seqs: list[list[int]] = []
+    if ast_seed_path:
+        ast_snippets = extract_repo_ast_snippets([ast_seed_path])
+        ast_seed_seqs = encode_with_tokenizer(ast_snippets, base_runner.tokenizer)
+
     cold_prompt = _make_cold_codegen_prompt(base_runner.tokenizer, enable_thinking=enable_thinking)
     w3_vanilla = sweep_runner.run_vanilla_jax(cold_prompt, max_new_tokens=max_new_tokens)
-    w3_tree = sweep_runner.run_tpuforge_tree(cold_prompt, max_new_tokens=max_new_tokens)
+    w3_tree = sweep_runner.run_tpuforge_tree(
+        cold_prompt,
+        max_new_tokens=max_new_tokens,
+        seed_token_sequences=ast_seed_seqs or None,
+    )
     w3_block = (
-        block_runner.run_block_tree(cold_prompt, max_new_tokens=max_new_tokens)
+        block_runner.run_block_tree(
+            cold_prompt,
+            max_new_tokens=max_new_tokens,
+            seed_token_sequences=ast_seed_seqs or None,
+        )
         if block_runner is not None
         else None
     )
@@ -379,6 +394,7 @@ def run_benchmark_suite(
         "tile_size": base_runner.tile_size,
         "dtype": str(base_runner.dtype),
         "weight_quant": base_runner.weight_quant,
+        "ast_seed_tokens": sum(len(seq) for seq in ast_seed_seqs),
         "model_hbm_bytes": base_runner.model_hbm_bytes,
         "max_seq_len": max_seq_len,
         "max_new_tokens": max_new_tokens,
@@ -480,6 +496,11 @@ def main() -> int:
         help="Weight-only systolic quantization mode ('none', 'int8', or 'fp8').",
     )
     parser.add_argument(
+        "--ast-seed-path",
+        default=None,
+        help="Optional repository file/directory to seed C++ SuffixIndex out-of-band on cold prompts.",
+    )
+    parser.add_argument(
         "--output-json",
         default="benchmarks/results/latest_qwen_bench.json",
         help="Path to write JSON telemetry output.",
@@ -498,6 +519,7 @@ def main() -> int:
         draft_model_id=args.draft_model or None,
         top_k=args.top_k,
         weight_quant=args.weight_quant,
+        ast_seed_path=args.ast_seed_path,
     )
     return 0
 

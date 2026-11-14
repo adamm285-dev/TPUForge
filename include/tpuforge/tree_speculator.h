@@ -122,6 +122,13 @@ public:
     void append_token(int32_t token_id);
     void append_tokens(const int32_t* tokens, size_t count);
 
+    // Seeds order 1..4 n-gram transitions out-of-band without appending to context_tokens()
+    // or creating cross-sequence boundary transitions.
+    void seed_tokens(const int32_t* tokens, size_t count);
+    void seed_sequence(const std::vector<int32_t>& sequence);
+    void seed_sequences(const std::vector<std::vector<int32_t>>& sequences);
+    size_t seeded_tokens() const noexcept;
+
     std::vector<TreeBuilder::BranchCandidate> query(
         const std::vector<int32_t>& path_after_root,
         size_t top_k = 3

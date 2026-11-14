@@ -10,7 +10,7 @@ import os
 import struct
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
@@ -1588,6 +1588,7 @@ class QwenBenchmarkRunner:
         prompt_tokens: list[int],
         max_new_tokens: int,
         eos_token_ids: Iterable[int] | None = None,
+        seed_token_sequences: Sequence[Sequence[int]] | None = None,
     ) -> RunMetrics:
         """Mode 3 (Levers 1 + 2 M-002 + M-003): Native C++ ForgeEngine systolic tree."""
         self._validate_bounds(prompt_tokens, max_new_tokens)
@@ -1686,9 +1687,16 @@ class QwenBenchmarkRunner:
             prefill_step_fn=prefill_step_fn,
             greedy_step_fn=greedy_step_fn,
         )
+        seed_seqs = (
+            [[int(t) for t in seq] for seq in seed_token_sequences if len(seq) >= 2]
+            if seed_token_sequences is not None
+            else []
+        )
         req = tpu.GenerationRequest()
         req.prompt_tokens = list(prompt_tokens)
         req.eos_token_ids = eos_list
+        if seed_seqs:
+            req.seed_token_sequences = seed_seqs
         req.max_tokens = int(max_new_tokens)
         req.temperature = 0.0
 
@@ -1723,6 +1731,8 @@ class QwenBenchmarkRunner:
                 "tile_size": self.tile_size,
                 "tp_size": self.tp_size,
                 "weight_quant": self.weight_quant,
+                "ast_seed_sequences": len(seed_seqs),
+                "ast_seed_tokens": sum(len(seq) for seq in seed_seqs),
             },
         )
 

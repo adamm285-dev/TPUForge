@@ -5,7 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -980,6 +980,7 @@ class QwenBlockTreeRunner:
         max_new_tokens: int,
         eos_token_ids: Iterable[int] | None = None,
         use_suffix_fallback: bool = True,
+        seed_token_sequences: Sequence[Sequence[int]] | None = None,
     ) -> RunMetrics:
         """Run native C++ ForgeEngine with block-diffusion drafting packed into 128/256 tile."""
         self.target._validate_bounds(prompt_tokens, max_new_tokens)
@@ -1130,9 +1131,16 @@ class QwenBlockTreeRunner:
             greedy_step_fn=greedy_step_fn,
             draft_tree_fn=draft_tree_fn,
         )
+        seed_seqs = (
+            [[int(t) for t in seq] for seq in seed_token_sequences if len(seq) >= 2]
+            if seed_token_sequences is not None
+            else []
+        )
         req = tpu.GenerationRequest()
         req.prompt_tokens = list(prompt_tokens)
         req.eos_token_ids = eos_list
+        if seed_seqs:
+            req.seed_token_sequences = seed_seqs
         req.max_tokens = int(max_new_tokens)
         req.temperature = 0.0
 
@@ -1172,6 +1180,7 @@ class QwenBlockTreeRunner:
                 "tp_size": self.tp_size,
                 "weight_quant": self.target.weight_quant,
                 "draft_weight_quant": self.weight_quant,
+                "ast_seed_tokens": sum(len(seq) for seq in seed_seqs),
             },
         )
 

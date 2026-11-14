@@ -453,6 +453,7 @@ SystolicTree TreeBuilder::build_from_branching_callback(
 struct SuffixIndex::Impl {
     std::vector<int32_t> context;
     std::unordered_map<NGramKey, NGramBucket, NGramKeyHash> buckets;
+    size_t seeded_tokens{0};
 };
 
 SuffixIndex::SuffixIndex() : impl_(new Impl()) {}
@@ -497,6 +498,7 @@ void SuffixIndex::reset(const std::vector<int32_t>& initial_tokens) {
     }
     impl_->context.clear();
     impl_->buckets.clear();
+    impl_->seeded_tokens = 0;
     if (!initial_tokens.empty()) {
         append_tokens(initial_tokens.data(), initial_tokens.size());
     }
@@ -517,7 +519,8 @@ void SuffixIndex::append_token(int32_t token_id) {
             for (size_t k = 0; k < order; ++k) {
                 key.t[k] = impl_->context[start + k];
             }
-            impl_->buckets[key].record(token_id, static_cast<uint64_t>(pos));
+            // Live transitions carry 1-based position so live recency always exceeds pos == 0 seeds.
+            impl_->buckets[key].record(token_id, static_cast<uint64_t>(old_len));
         }
     }
     impl_->context.push_back(token_id);
@@ -542,22 +545,65 @@ void SuffixIndex::append_tokens(const int32_t* tokens, size_t count) {
     }
 }
 
+void SuffixIndex::seed_tokens(const int32_t* tokens, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    if (!tokens) {
+        throw std::invalid_argument("SuffixIndex::seed_tokens received null tokens pointer");
+    }
+    if (!impl_) {
+        impl_ = new Impl();
+    }
+    if (count < 2) {
+        return;
+    }
+    impl_->seeded_tokens += count;
+    if (impl_->buckets.empty() && count > 256) {
+        impl_->buckets.reserve(count * 3);
+    }
+    NGramKey key;
+    for (size_t i = 1; i < count; ++i) {
+        const size_t max_order = std::min<size_t>(4, i);
+        for (size_t order = 1; order <= max_order; ++order) {
+            key.order = static_cast<uint8_t>(order);
+            const size_t start = i - order;
+            for (size_t k = 0; k < order; ++k) {
+                key.t[k] = tokens[start + k];
+            }
+            impl_->buckets[key].record(tokens[i], 0ULL);
+        }
+    }
+}
+
+void SuffixIndex::seed_sequence(const std::vector<int32_t>& sequence) {
+    seed_tokens(sequence.empty() ? nullptr : sequence.data(), sequence.size());
+}
+
+void SuffixIndex::seed_sequences(const std::vector<std::vector<int32_t>>& sequences) {
+    for (const auto& seq : sequences) {
+        seed_sequence(seq);
+    }
+}
+
+size_t SuffixIndex::seeded_tokens() const noexcept {
+    return impl_ ? impl_->seeded_tokens : 0;
+}
+
 std::vector<TreeBuilder::BranchCandidate> SuffixIndex::query(
     const std::vector<int32_t>& path_after_root,
     size_t top_k
 ) const {
-    if (!impl_ || impl_->context.size() < 2 || top_k == 0) {
+    if (!impl_ || impl_->context.empty() || impl_->buckets.empty() || top_k == 0) {
         return {};
     }
     const size_t ctx_len = impl_->context.size();
     const size_t vlen = ctx_len + path_after_root.size();
     const size_t limit_order = std::min<size_t>(4, vlen);
+    const double inv_ctx_len = 1.0 / static_cast<double>(std::max<size_t>(1, ctx_len));
 
     std::unordered_map<int32_t, double> scores;
     for (size_t order = limit_order; order >= 1; --order) {
-        if (ctx_len <= order) {
-            continue;
-        }
         NGramKey key;
         key.order = static_cast<uint8_t>(order);
         const size_t v_start = vlen - order;
@@ -572,7 +618,6 @@ std::vector<TreeBuilder::BranchCandidate> SuffixIndex::query(
             continue;
         }
         const double order_weight = std::pow(10.0, static_cast<double>(order));
-        const double inv_ctx_len = 1.0 / static_cast<double>(ctx_len);
         it->second.visit_top([&](const TransitionStats& e) {
             const double sum_recency =
                 static_cast<double>(e.count) + static_cast<double>(e.pos_sum) * inv_ctx_len;
@@ -761,7 +806,8 @@ SystolicTree TreeBuilder::build_from_block_top_k(
     };
 
     auto push_suffix_edges = [&](int32_t parent_idx, float discount) {
-        if (!suffix_fallback || suffix_fallback->size() < 2) {
+        if (!suffix_fallback || suffix_fallback->size() == 0 ||
+            (suffix_fallback->size() < 2 && suffix_fallback->seeded_tokens() == 0)) {
             return;
         }
         const size_t depth = static_cast<size_t>(tree.nodes()[static_cast<size_t>(parent_idx)].depth);
