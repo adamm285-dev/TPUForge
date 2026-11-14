@@ -48,6 +48,48 @@ int32_t argmax_row(const float* row, size_t vocab_size) {
     return best_idx;
 }
 
+template <typename BestTokenFn>
+TreeVerificationResult walk_greedy_tree(
+    const SystolicTree& tree,
+    size_t vocab_size,
+    BestTokenFn&& best_token_for_node
+) {
+    TreeVerificationResult result;
+    const auto& nodes = tree.nodes();
+    int32_t curr = 0;
+    result.accepted_node_indices.push_back(0);
+
+    while (true) {
+        const int32_t best_tok = best_token_for_node(static_cast<size_t>(curr));
+
+        int32_t matched_child = -1;
+        for (int32_t c : nodes[static_cast<size_t>(curr)].children) {
+            const int32_t c_tok = nodes[static_cast<size_t>(c)].token_id;
+            if (c_tok < 0 || static_cast<size_t>(c_tok) >= vocab_size) {
+                throw std::out_of_range("Draft child token_id out of [0, vocab_size)");
+            }
+            if (matched_child < 0 && c_tok == best_tok) {
+                matched_child = c;
+            }
+        }
+
+        if (matched_child >= 0) {
+            result.accepted_draft_tokens.push_back(best_tok);
+            result.emitted_tokens.push_back(best_tok);
+            result.accepted_node_indices.push_back(matched_child);
+            curr = matched_child;
+        } else {
+            result.bonus_token = best_tok;
+            result.emitted_tokens.push_back(best_tok);
+            break;
+        }
+    }
+
+    result.acceptance_count = result.accepted_draft_tokens.size();
+    result.terminal_depth = nodes[static_cast<size_t>(curr)].depth;
+    return result;
+}
+
 void compute_softmax(const float* logits, size_t vocab_size, float temperature, std::vector<double>& out_probs) {
     out_probs.resize(vocab_size);
     double max_val = -std::numeric_limits<double>::infinity();
@@ -410,41 +452,29 @@ TreeVerificationResult SystolicTreeVerifier::verify_greedy(
         throw std::invalid_argument("Invalid arguments to SystolicTreeVerifier::verify_greedy");
     }
 
-    TreeVerificationResult result;
-    const auto& nodes = tree.nodes();
-    int32_t curr = 0;
-    result.accepted_node_indices.push_back(0);
+    return walk_greedy_tree(tree, vocab_size, [&](size_t node_idx) {
+        return argmax_row(target_logits_128 + (node_idx * vocab_size), vocab_size);
+    });
+}
 
-    while (true) {
-        const float* row = target_logits_128 + (static_cast<size_t>(curr) * vocab_size);
-        int32_t best_tok = argmax_row(row, vocab_size);
-
-        int32_t matched_child = -1;
-        for (int32_t c : nodes[static_cast<size_t>(curr)].children) {
-            const int32_t c_tok = nodes[static_cast<size_t>(c)].token_id;
-            if (c_tok < 0 || static_cast<size_t>(c_tok) >= vocab_size) {
-                throw std::out_of_range("Draft child token_id out of [0, vocab_size)");
-            }
-            if (matched_child < 0 && c_tok == best_tok) {
-                matched_child = c;
-            }
-        }
-
-        if (matched_child >= 0) {
-            result.accepted_draft_tokens.push_back(best_tok);
-            result.emitted_tokens.push_back(best_tok);
-            result.accepted_node_indices.push_back(matched_child);
-            curr = matched_child;
-        } else {
-            result.bonus_token = best_tok;
-            result.emitted_tokens.push_back(best_tok);
-            break;
-        }
+TreeVerificationResult SystolicTreeVerifier::verify_greedy_tokens(
+    const SystolicTree& tree,
+    const int32_t* target_argmax_tokens,
+    size_t vocab_size
+) {
+    if (!target_argmax_tokens || vocab_size == 0 ||
+        vocab_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        tree.num_nodes() == 0 || tree.num_nodes() > tree.tile_size()) {
+        throw std::invalid_argument("Invalid arguments to SystolicTreeVerifier::verify_greedy_tokens");
     }
 
-    result.acceptance_count = result.accepted_draft_tokens.size();
-    result.terminal_depth = nodes[static_cast<size_t>(curr)].depth;
-    return result;
+    return walk_greedy_tree(tree, vocab_size, [&](size_t node_idx) {
+        const int32_t best_tok = target_argmax_tokens[node_idx];
+        if (best_tok < 0 || static_cast<size_t>(best_tok) >= vocab_size) {
+            throw std::domain_error("NaN or out-of-bounds token in target_argmax_tokens");
+        }
+        return best_tok;
+    });
 }
 
 TreeVerificationResult SystolicTreeVerifier::verify_stochastic(

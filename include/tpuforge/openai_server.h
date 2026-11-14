@@ -110,6 +110,19 @@ public:
         int32_t prev_valid_prefix_len,
         const std::vector<int32_t>& accepted_row_indices
     )>;
+    using PrefillStepFn = std::function<void(
+        int32_t valid_prefix_len,
+        const int32_t* token_tile,
+        const int32_t* pos_tile,
+        const float* mask_TxT
+    )>;
+    using GreedyStepFn = std::function<void(
+        int32_t valid_prefix_len,
+        const int32_t* token_tile,
+        const int32_t* pos_tile,
+        const float* mask_TxT,
+        int32_t* out_argmax_tokens
+    )>;
     using StreamTokenCallback = std::function<bool(const std::string& utf8_delta, int32_t token_id)>;
 
     ForgeEngine(
@@ -124,7 +137,9 @@ public:
         const StaticArena::Config& config,
         TargetStepFn target_step_fn,
         CommitKvFn commit_kv_fn = nullptr,
-        std::string model_id = "tpuforge-custom-128"
+        std::string model_id = "tpuforge-custom-128",
+        PrefillStepFn prefill_step_fn = nullptr,
+        GreedyStepFn greedy_step_fn = nullptr
     );
 
     ~ForgeEngine() = default;
@@ -158,6 +173,8 @@ private:
     std::unique_ptr<ZeroRecompileExecutor> executor_;
     TargetStepFn target_step_fn_;
     CommitKvFn commit_kv_fn_;
+    PrefillStepFn prefill_step_fn_;
+    GreedyStepFn greedy_step_fn_;
     std::vector<float> pjrt_step_k_;
     std::vector<float> pjrt_step_v_;
     mutable std::mutex engine_mu_;

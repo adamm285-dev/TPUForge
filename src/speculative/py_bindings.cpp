@@ -66,6 +66,20 @@ nb::ndarray<nb::numpy, T, nb::ndim<2>> make_2d_numpy(const T* src, size_t rows, 
     return nb::ndarray<nb::numpy, T, nb::ndim<2>>(raw, 2, shape, owner);
 }
 
+nb::object invoke_py_tile_cb(
+    const nb::callable& fn,
+    int32_t valid_prefix_len,
+    const int32_t* tok_ptr,
+    const int32_t* pos_ptr,
+    const float* mask_ptr,
+    size_t T
+) {
+    auto tok_arr = make_1d_numpy<int32_t>(tok_ptr, T);
+    auto pos_arr = make_1d_numpy<int32_t>(pos_ptr, T);
+    auto mask_arr = make_2d_numpy<float>(mask_ptr, T, T);
+    return fn(valid_prefix_len, tok_arr, pos_arr, mask_arr);
+}
+
 bool is_python_active() noexcept {
 #if PY_VERSION_HEX >= 0x030D0000
     return Py_IsInitialized() != 0 && Py_IsFinalizing() == 0;
@@ -271,6 +285,21 @@ NB_MODULE(_tpuforge_ext, m) {
                     tree, logits.data(), vocab_size);
             },
             nb::arg("tree"), nb::arg("target_logits_128").noconvert())
+        .def_static("verify_greedy_tokens",
+            [](const tpuforge::SystolicTree& tree,
+               nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> argmax_tokens,
+               size_t vocab_size) {
+                if (argmax_tokens.shape(0) != tree.tile_size()) {
+                    throw std::invalid_argument("Expected target_argmax_tokens shape [tree.tile_size()]");
+                }
+                if (vocab_size == 0 ||
+                    vocab_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                    throw std::invalid_argument("vocab_size out of valid [1, INT32_MAX] range");
+                }
+                return tpuforge::SystolicTreeVerifier::verify_greedy_tokens(
+                    tree, argmax_tokens.data(), vocab_size);
+            },
+            nb::arg("tree"), nb::arg("target_argmax_tokens").noconvert(), nb::arg("vocab_size"))
         .def_static("verify_stochastic",
             [](const tpuforge::SystolicTree& tree,
                nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> logits,
@@ -472,9 +501,11 @@ NB_MODULE(_tpuforge_ext, m) {
         .def("__init__",
              [](tpuforge::ForgeEngine* self,
                 const tpuforge::StaticArena::Config& config,
-                nb::callable target_step_fn,
+                nb::object target_step_obj,
                 nb::object commit_kv_obj,
-                std::string model_id) {
+                std::string model_id,
+                nb::object prefill_step_obj,
+                nb::object greedy_step_obj) {
                  auto py_deleter = [](nb::callable* p) noexcept {
                      if (!p) {
                          return;
@@ -485,21 +516,26 @@ NB_MODULE(_tpuforge_ext, m) {
                      }
                  };
 
-                 auto step_cb = std::shared_ptr<nb::callable>(
-                     new nb::callable(std::move(target_step_fn)), py_deleter
-                 );
-
-                 std::shared_ptr<nb::callable> kv_cb;
-                 if (!commit_kv_obj.is_none()) {
-                     kv_cb = std::shared_ptr<nb::callable>(
-                         new nb::callable(nb::cast<nb::callable>(commit_kv_obj)), py_deleter
+                 auto wrap_opt_cb = [&py_deleter](const nb::object& obj) -> std::shared_ptr<nb::callable> {
+                     if (obj.is_none()) {
+                         return {};
+                     }
+                     return std::shared_ptr<nb::callable>(
+                         new nb::callable(nb::cast<nb::callable>(obj)), py_deleter
                      );
-                 }
+                 };
+
+                 auto step_cb = wrap_opt_cb(target_step_obj);
+                 auto kv_cb = wrap_opt_cb(commit_kv_obj);
+                 auto prefill_cb = wrap_opt_cb(prefill_step_obj);
+                 auto greedy_cb = wrap_opt_cb(greedy_step_obj);
 
                  const size_t vocab_size = config.vocab_size;
                  const size_t T = config.tile_size;
-                 tpuforge::ForgeEngine::TargetStepFn cpp_step =
-                     [step_cb, vocab_size, T](
+
+                 tpuforge::ForgeEngine::TargetStepFn cpp_step;
+                 if (step_cb) {
+                     cpp_step = [step_cb, vocab_size, T](
                          int32_t valid_prefix_len,
                          const int32_t* tok_ptr,
                          const int32_t* pos_ptr,
@@ -511,11 +547,9 @@ NB_MODULE(_tpuforge_ext, m) {
                          }
                          nb::gil_scoped_acquire gil;
                          try {
-                             auto tok_arr = make_1d_numpy<int32_t>(tok_ptr, T);
-                             auto pos_arr = make_1d_numpy<int32_t>(pos_ptr, T);
-                             auto mask_arr = make_2d_numpy<float>(mask_ptr, T, T);
-
-                             nb::object ret = (*step_cb)(valid_prefix_len, tok_arr, pos_arr, mask_arr);
+                             nb::object ret = invoke_py_tile_cb(
+                                 *step_cb, valid_prefix_len, tok_ptr, pos_ptr, mask_ptr, T
+                             );
                              nb::module_ np_mod = nb::module_::import_("numpy");
                              nb::object arr_obj = np_mod.attr("ascontiguousarray")(
                                  ret, np_mod.attr("float32")
@@ -533,6 +567,7 @@ NB_MODULE(_tpuforge_ext, m) {
                              throw std::runtime_error(e.what());
                          }
                      };
+                 }
 
                  tpuforge::ForgeEngine::CommitKvFn cpp_kv;
                  if (kv_cb) {
@@ -552,14 +587,90 @@ NB_MODULE(_tpuforge_ext, m) {
                      };
                  }
 
+                 tpuforge::ForgeEngine::PrefillStepFn cpp_prefill;
+                 if (prefill_cb) {
+                     cpp_prefill = [prefill_cb, T](
+                         int32_t valid_prefix_len,
+                         const int32_t* tok_ptr,
+                         const int32_t* pos_ptr,
+                         const float* mask_ptr
+                     ) {
+                         if (!is_python_active()) {
+                             throw std::runtime_error("Python interpreter is finalizing");
+                         }
+                         nb::gil_scoped_acquire gil;
+                         try {
+                             (void)invoke_py_tile_cb(
+                                 *prefill_cb, valid_prefix_len, tok_ptr, pos_ptr, mask_ptr, T
+                             );
+                         } catch (nb::python_error& e) {
+                             throw std::runtime_error(e.what());
+                         }
+                     };
+                 }
+
+                 tpuforge::ForgeEngine::GreedyStepFn cpp_greedy;
+                 if (greedy_cb) {
+                     cpp_greedy = [greedy_cb, T](
+                         int32_t valid_prefix_len,
+                         const int32_t* tok_ptr,
+                         const int32_t* pos_ptr,
+                         const float* mask_ptr,
+                         int32_t* out_argmax_tokens
+                     ) {
+                         if (!is_python_active()) {
+                             throw std::runtime_error("Python interpreter is finalizing");
+                         }
+                         nb::gil_scoped_acquire gil;
+                         try {
+                             nb::object ret = invoke_py_tile_cb(
+                                 *greedy_cb, valid_prefix_len, tok_ptr, pos_ptr, mask_ptr, T
+                             );
+                             using Int32Tile = nb::ndarray<
+                                 const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu
+                             >;
+                             Int32Tile fast_arr;
+                             if (nb::try_cast<Int32Tile>(ret, fast_arr)) {
+                                 if (fast_arr.shape(0) != T) {
+                                     throw std::invalid_argument(
+                                         "greedy_step_fn return token shape mismatch: expected [tile_size]"
+                                     );
+                                 }
+                                 std::memcpy(out_argmax_tokens, fast_arr.data(), T * sizeof(int32_t));
+                             } else {
+                                 nb::module_ np_mod = nb::module_::import_("numpy");
+                                 nb::object arr_obj = np_mod.attr("ascontiguousarray")(
+                                     ret, np_mod.attr("int32")
+                                 );
+                                 auto out_arr = nb::cast<Int32Tile>(arr_obj);
+                                 if (out_arr.shape(0) != T) {
+                                     throw std::invalid_argument(
+                                         "greedy_step_fn return token shape mismatch: expected [tile_size]"
+                                     );
+                                 }
+                                 std::memcpy(out_argmax_tokens, out_arr.data(), T * sizeof(int32_t));
+                             }
+                         } catch (nb::python_error& e) {
+                             throw std::runtime_error(e.what());
+                         }
+                     };
+                 }
+
                  new (self) tpuforge::ForgeEngine(
-                     config, std::move(cpp_step), std::move(cpp_kv), std::move(model_id)
+                     config,
+                     std::move(cpp_step),
+                     std::move(cpp_kv),
+                     std::move(model_id),
+                     std::move(cpp_prefill),
+                     std::move(cpp_greedy)
                  );
              },
              nb::arg("config"),
-             nb::arg("target_step_fn"),
+             nb::arg("target_step_fn") = nb::none(),
              nb::arg("commit_kv_fn") = nb::none(),
-             nb::arg("model_id") = "")
+             nb::arg("model_id") = "",
+             nb::arg("prefill_step_fn") = nb::none(),
+             nb::arg("greedy_step_fn") = nb::none())
         .def("generate",
              [](tpuforge::ForgeEngine& eng, const tpuforge::GenerationRequest& req) {
                  tpuforge::GenerationRequest req_copy = req;

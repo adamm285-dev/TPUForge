@@ -130,6 +130,41 @@ def test_tree_and_verifier_nan_inf_bounds_guards():
     with pytest.raises(IndexError):
         tpu.SystolicTreeVerifier.verify_stochastic(oob_tree, logits, temperature=1.0, seed=1)
 
+    # verify_greedy_tokens parity (tile=128 & tile=256) + NaN sentinel / bounds guards.
+    for tile_w in (128, 256):
+        ptree = tpu.SystolicTree(5, tile_w)
+        c1 = ptree.add_child(0, 3, 0.9)
+        ptree.add_child(c1, 6, 0.8)
+        plogits = np.full((tile_w, 8), -5.0, dtype=np.float32)
+        plogits[0, 3] = 4.0
+        plogits[c1, 6] = 4.0
+        plogits[2:, 7] = 4.0
+        argmax_arr = np.argmax(plogits, axis=-1).astype(np.int32)
+        ref = tpu.SystolicTreeVerifier.verify_greedy(ptree, plogits)
+        fast = tpu.SystolicTreeVerifier.verify_greedy_tokens(ptree, argmax_arr, 8)
+        assert fast.emitted_tokens == ref.emitted_tokens == [3, 6, 7]
+        assert fast.accepted_draft_tokens == ref.accepted_draft_tokens == [3, 6]
+        assert fast.accepted_node_indices == ref.accepted_node_indices
+        assert fast.bonus_token == ref.bonus_token == 7
+        assert fast.acceptance_count == ref.acceptance_count == 2
+        assert fast.terminal_depth == ref.terminal_depth == 2
+
+    bad_nan_toks = np.zeros((128,), dtype=np.int32)
+    bad_nan_toks[0] = -1
+    with pytest.raises(ValueError):
+        tpu.SystolicTreeVerifier.verify_greedy_tokens(tree, bad_nan_toks, 8)
+
+    bad_oob_toks = np.zeros((128,), dtype=np.int32)
+    bad_oob_toks[0] = 8
+    with pytest.raises(ValueError):
+        tpu.SystolicTreeVerifier.verify_greedy_tokens(tree, bad_oob_toks, 8)
+
+    with pytest.raises(ValueError):
+        tpu.SystolicTreeVerifier.verify_greedy_tokens(tree, np.zeros((64,), dtype=np.int32), 8)
+
+    with pytest.raises(IndexError):
+        tpu.SystolicTreeVerifier.verify_greedy_tokens(oob_tree, np.zeros((128,), dtype=np.int32), 8)
+
 
 def test_sole_mass_rejection_never_reemits_rejected_child():
     # Child token 1 has ~1.0 probability, non-draft token 2 has tiny exp(-27) ~ 1.87e-12.

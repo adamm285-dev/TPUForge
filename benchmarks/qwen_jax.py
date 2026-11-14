@@ -1006,9 +1006,15 @@ class QwenBenchmarkRunner:
             )
             normed = _rms_norm(x_final, final_norm, cfg.rms_norm_eps)
             logits_tile = _linear(normed, lm_head, out_dtype=jnp.float32)
+            has_nan = jnp.any(jnp.isnan(logits_tile), axis=-1)
+            argmax_tokens = jnp.where(
+                has_nan,
+                jnp.int32(-1),
+                jnp.argmax(logits_tile, axis=-1).astype(jnp.int32),
+            )
             if rep_sharding is not None:
-                logits_tile = jax.lax.with_sharding_constraint(logits_tile, rep_sharding)
-            return logits_tile, step_k_out, step_v_out
+                argmax_tokens = jax.lax.with_sharding_constraint(argmax_tokens, rep_sharding)
+            return argmax_tokens, step_k_out, step_v_out
 
         @jax.jit
         def commit_kv_jit(
@@ -1202,7 +1208,7 @@ class QwenBenchmarkRunner:
             tok_np[0] = cur_tok
             pos_np[0] = cur_prefix
 
-            logits_tile, step_k, step_v = self._static_systolic_tile_step_jit(
+            argmax_tokens, step_k, step_v = self._static_systolic_tile_step_jit(
                 self._weights_tuple,
                 self._put_rep(cur_prefix, dtype=jnp.int32),
                 self._put_rep(tok_np),
@@ -1214,8 +1220,10 @@ class QwenBenchmarkRunner:
             forward_passes += 1
             decode_passes += 1
 
-            next_tok = int(jnp.argmax(logits_tile[0]))
-            jax.block_until_ready(logits_tile)
+            argmax_np = np.asarray(jax.device_get(argmax_tokens), dtype=np.int32)
+            next_tok = int(argmax_np[0])
+            if next_tok < 0:
+                raise ValueError("NaN detected in target logits")
             if next_tok in eos_set:
                 break
 
@@ -1289,13 +1297,13 @@ class QwenBenchmarkRunner:
         }
         prefill_tiles = (max(0, len(prompt_tokens) - 1) + T - 1) // T
 
-        def target_step_fn(
+        def _dispatch_static_tile(
             valid_prefix_len: int,
             tok_tile: np.ndarray,
             pos_tile: np.ndarray,
             mask_tile: np.ndarray,
-        ) -> np.ndarray:
-            logits_tile, step_k, step_v = self._static_systolic_tile_step_jit(
+        ) -> jax.Array:
+            argmax_tokens, step_k, step_v = self._static_systolic_tile_step_jit(
                 self._weights_tuple,
                 self._put_rep(valid_prefix_len, dtype=jnp.int32),
                 self._put_rep(tok_tile),
@@ -1306,9 +1314,27 @@ class QwenBenchmarkRunner:
             )
             state["step_k"] = step_k
             state["step_v"] = step_v
-            logits_np = np.asarray(jax.device_get(logits_tile), dtype=np.float32)
             state["step_idx"] += 1
-            return logits_np
+            return argmax_tokens
+
+        def prefill_step_fn(
+            valid_prefix_len: int,
+            tok_tile: np.ndarray,
+            pos_tile: np.ndarray,
+            mask_tile: np.ndarray,
+        ) -> None:
+            _dispatch_static_tile(valid_prefix_len, tok_tile, pos_tile, mask_tile)
+
+        def greedy_step_fn(
+            valid_prefix_len: int,
+            tok_tile: np.ndarray,
+            pos_tile: np.ndarray,
+            mask_tile: np.ndarray,
+        ) -> np.ndarray:
+            argmax_tokens = _dispatch_static_tile(
+                valid_prefix_len, tok_tile, pos_tile, mask_tile
+            )
+            return np.asarray(jax.device_get(argmax_tokens), dtype=np.int32)
 
         def commit_kv_fn(prev_prefix_len: int, accepted_row_indices: list[int]) -> None:
             n_valid = len(accepted_row_indices)
@@ -1324,10 +1350,10 @@ class QwenBenchmarkRunner:
                 self._put_rep(src_rows),
                 self._put_rep(n_valid, dtype=jnp.int32),
             )
-            jax.block_until_ready((k_next, v_next))
             state["k_cache"] = k_next
             state["v_cache"] = v_next
             if state["step_idx"] == prefill_tiles and state["t_prefill_done"] is None:
+                jax.block_until_ready((k_next, v_next))
                 state["t_prefill_done"] = time.perf_counter()
 
         arena_cfg = tpu.StaticArenaConfig()
@@ -1338,7 +1364,14 @@ class QwenBenchmarkRunner:
         arena_cfg.vocab_size = self.config.vocab_size
         arena_cfg.tile_size = T
 
-        engine = tpu.ForgeEngine(arena_cfg, target_step_fn, commit_kv_fn, f"qwen-tpuforge-{T}")
+        engine = tpu.ForgeEngine(
+            arena_cfg,
+            None,
+            commit_kv_fn,
+            f"qwen-tpuforge-{T}",
+            prefill_step_fn=prefill_step_fn,
+            greedy_step_fn=greedy_step_fn,
+        )
         req = tpu.GenerationRequest()
         req.prompt_tokens = list(prompt_tokens)
         req.eos_token_ids = eos_list
@@ -1347,6 +1380,7 @@ class QwenBenchmarkRunner:
 
         t_all0 = time.perf_counter()
         res = engine.generate(req)
+        jax.block_until_ready((state["k_cache"], state["v_cache"]))
         t_all1 = time.perf_counter()
 
         compiles_delta = self.static_step_compile_count - compiles_before

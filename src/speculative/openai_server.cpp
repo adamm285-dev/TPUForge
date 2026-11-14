@@ -1029,22 +1029,26 @@ ForgeEngine::ForgeEngine(
     const StaticArena::Config& config,
     TargetStepFn target_step_fn,
     CommitKvFn commit_kv_fn,
-    std::string model_id
+    std::string model_id,
+    PrefillStepFn prefill_step_fn,
+    GreedyStepFn greedy_step_fn
 )
     : config_(config),
       model_id_(std::move(model_id)),
       tokenizer_(config.vocab_size),
       arena_(config),
       target_step_fn_(std::move(target_step_fn)),
-      commit_kv_fn_(std::move(commit_kv_fn)) {
+      commit_kv_fn_(std::move(commit_kv_fn)),
+      prefill_step_fn_(std::move(prefill_step_fn)),
+      greedy_step_fn_(std::move(greedy_step_fn)) {
     if (config_.vocab_size < ByteTokenizer::kMinVocabSize) {
         throw std::invalid_argument("ForgeEngine requires vocab_size >= 260");
     }
     if (config_.max_seq_len < 2 * config_.tile_size) {
         throw std::invalid_argument("ForgeEngine requires max_seq_len >= 2 * tile_size");
     }
-    if (!target_step_fn_) {
-        throw std::invalid_argument("ForgeEngine custom backend requires a non-null target_step_fn");
+    if (!target_step_fn_ && !greedy_step_fn_) {
+        throw std::invalid_argument("ForgeEngine custom backend requires target_step_fn or greedy_step_fn");
     }
     if (model_id_.empty()) {
         model_id_ = "tpuforge-custom-" + std::to_string(config_.tile_size);
@@ -1058,6 +1062,11 @@ size_t ForgeEngine::compile_count() const {
 std::vector<int32_t> ForgeEngine::validate_request(const GenerationRequest& req) const {
     if (!std::isfinite(req.temperature) || req.temperature < 0.0f || req.temperature > 2.0f) {
         throw std::invalid_argument("temperature must be a finite float in [0.0, 2.0]");
+    }
+    if (req.temperature >= 1e-6f && !executor_ && !target_step_fn_) {
+        throw std::invalid_argument(
+            "Stochastic sampling (temperature > 0) requires target_step_fn returning full logits"
+        );
     }
     if (req.max_tokens > kMaxTokensPerRequest) {
         throw std::invalid_argument("max_tokens exceeds maximum allowed per request (4096)");
@@ -1119,6 +1128,7 @@ GenerationResult ForgeEngine::generate(
 
     const size_t T = config_.tile_size;
     const size_t max_prefix = config_.max_seq_len - T;
+    std::vector<int32_t> greedy_tokens(T, 0);
 
     arena_.set_valid_prefix_len(0);
 
@@ -1154,7 +1164,24 @@ GenerationResult ForgeEngine::generate(
         }
 
         arena_.set_valid_prefix_len(static_cast<int32_t>(offset));
-        execute_tile_step();
+        if (!executor_ && prefill_step_fn_) {
+            prefill_step_fn_(
+                arena_.valid_prefix_len(),
+                arena_.token_tile(),
+                arena_.position_tile(),
+                arena_.causal_mask()
+            );
+        } else if (!executor_ && !target_step_fn_ && greedy_step_fn_) {
+            greedy_step_fn_(
+                arena_.valid_prefix_len(),
+                arena_.token_tile(),
+                arena_.position_tile(),
+                arena_.causal_mask(),
+                greedy_tokens.data()
+            );
+        } else {
+            execute_tile_step();
+        }
         result.target_forward_passes += 1;
 
         prefill_accepted.clear();
@@ -1203,23 +1230,38 @@ GenerationResult ForgeEngine::generate(
         std::memcpy(arena_.position_tile(), packed.position_offsets.data(), T * sizeof(int32_t));
         std::memcpy(arena_.causal_mask(), packed.additive_mask_f32.data(), T * T * sizeof(float));
 
-        execute_tile_step();
-        result.target_forward_passes += 1;
-        result.decode_forward_passes += 1;
-
         TreeVerificationResult verify_res;
-        if (req.temperature < 1e-6f) {
-            verify_res = SystolicTreeVerifier::verify_greedy(
-                tree, arena_.logits_tile(), config_.vocab_size
+        if (!executor_ && req.temperature < 1e-6f && greedy_step_fn_) {
+            greedy_step_fn_(
+                cur_prefix,
+                arena_.token_tile(),
+                arena_.position_tile(),
+                arena_.causal_mask(),
+                greedy_tokens.data()
+            );
+            result.target_forward_passes += 1;
+            result.decode_forward_passes += 1;
+            verify_res = SystolicTreeVerifier::verify_greedy_tokens(
+                tree, greedy_tokens.data(), config_.vocab_size
             );
         } else {
-            const uint64_t step_seed = splitmix64(
-                request_base_seed ^
-                (static_cast<uint64_t>(result.decode_forward_passes) * 0x9E3779B97F4A7C15ULL)
-            );
-            verify_res = SystolicTreeVerifier::verify_stochastic(
-                tree, arena_.logits_tile_128(), config_.vocab_size, req.temperature, step_seed
-            );
+            execute_tile_step();
+            result.target_forward_passes += 1;
+            result.decode_forward_passes += 1;
+
+            if (req.temperature < 1e-6f) {
+                verify_res = SystolicTreeVerifier::verify_greedy(
+                    tree, arena_.logits_tile(), config_.vocab_size
+                );
+            } else {
+                const uint64_t step_seed = splitmix64(
+                    request_base_seed ^
+                    (static_cast<uint64_t>(result.decode_forward_passes) * 0x9E3779B97F4A7C15ULL)
+                );
+                verify_res = SystolicTreeVerifier::verify_stochastic(
+                    tree, arena_.logits_tile_128(), config_.vocab_size, req.temperature, step_seed
+                );
+            }
         }
 
         size_t commit_count = 0;

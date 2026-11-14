@@ -396,3 +396,99 @@ def test_qwen_bfloat16_native_mxu_parity() -> None:
     assert m_static.token_ids == expected
     assert m_tree.token_ids == expected
     assert m_tree.mean_tokens_per_decode_pass > 2.0
+
+
+def test_forge_engine_on_device_argmax_zero_logits_transfer() -> None:
+    """Verify greedy prefill+decode invoke prefill_step_fn/greedy_step_fn with 0 full-logits calls."""
+    cfg = tpu.StaticArenaConfig()
+    cfg.max_seq_len = 512
+    cfg.hidden_dim = 128
+    cfg.num_kv_heads = 2
+    cfg.head_dim = 64
+    cfg.vocab_size = 512
+    cfg.tile_size = 128
+
+    prompt = [10 + (i % 10) for i in range(140)]
+
+    def _compute_next(prev_prefix_len: int, tok_tile: np.ndarray, pos_tile: np.ndarray) -> np.ndarray:
+        out = np.empty((128,), dtype=np.int32)
+        for r in range(128):
+            out[r] = 20 + ((int(tok_tile[r]) + int(pos_tile[r]) + int(prev_prefix_len)) % 30)
+        return out
+
+    counts_full = {"logits": 0, "kv": 0}
+    counts_fast = {"logits": 0, "prefill": 0, "greedy": 0, "kv": 0}
+
+    def full_logits_fn(valid_prefix_len: int, tok_tile, pos_tile, mask):
+        counts_full["logits"] += 1
+        next_toks = _compute_next(valid_prefix_len, tok_tile, pos_tile)
+        logits = np.full((128, cfg.vocab_size), -10.0, dtype=np.float32)
+        logits[np.arange(128), next_toks] = 10.0
+        return logits
+
+    def full_logits_tracked_fn(valid_prefix_len: int, tok_tile, pos_tile, mask):
+        counts_fast["logits"] += 1
+        next_toks = _compute_next(valid_prefix_len, tok_tile, pos_tile)
+        logits = np.full((128, cfg.vocab_size), -10.0, dtype=np.float32)
+        logits[np.arange(128), next_toks] = 10.0
+        return logits
+
+    def prefill_fn(valid_prefix_len: int, tok_tile, pos_tile, mask):
+        counts_fast["prefill"] += 1
+
+    def greedy_fn(valid_prefix_len: int, tok_tile, pos_tile, mask):
+        counts_fast["greedy"] += 1
+        return _compute_next(valid_prefix_len, tok_tile, pos_tile)
+
+    def kv_counter(counter: dict[str, int]):
+        def _commit(prev_len: int, accepted: list[int]) -> None:
+            counter["kv"] += 1
+
+        return _commit
+
+    engine_ref = tpu.ForgeEngine(cfg, full_logits_fn, kv_counter(counts_full), "ref-logits")
+    engine_fast = tpu.ForgeEngine(
+        cfg,
+        full_logits_tracked_fn,
+        kv_counter(counts_fast),
+        "fast-argmax",
+        prefill_step_fn=prefill_fn,
+        greedy_step_fn=greedy_fn,
+    )
+
+    req_greedy = tpu.GenerationRequest()
+    req_greedy.prompt_tokens = prompt
+    req_greedy.max_tokens = 12
+    req_greedy.temperature = 0.0
+    req_greedy.ignore_eos = True
+
+    res_ref = engine_ref.generate(req_greedy)
+    res_fast = engine_fast.generate(req_greedy)
+    assert list(res_fast.token_ids) == list(res_ref.token_ids)
+    assert len(res_fast.token_ids) == 12
+    assert counts_fast["prefill"] >= 2
+    assert counts_fast["greedy"] >= 1
+    assert counts_fast["logits"] == 0
+    assert counts_fast["kv"] == counts_full["kv"]
+
+    # Stochastic sampling cleanly routes to target_step_fn without touching greedy_step_fn.
+    greedy_before = counts_fast["greedy"]
+    req_stoch = tpu.GenerationRequest()
+    req_stoch.prompt_tokens = prompt
+    req_stoch.max_tokens = 6
+    req_stoch.temperature = 0.8
+    req_stoch.seed = 42
+    req_stoch.ignore_eos = True
+    res_stoch = engine_fast.generate(req_stoch)
+    assert len(res_stoch.token_ids) == 6
+    assert counts_fast["logits"] >= 1
+    assert counts_fast["greedy"] == greedy_before
+
+    # Greedy-only engine (target_step_fn=None) works for temperature=0.0 and rejects temperature > 0.
+    engine_greedy_only = tpu.ForgeEngine(
+        cfg, None, kv_counter({"kv": 0}), "greedy-only", greedy_step_fn=greedy_fn
+    )
+    res_only = engine_greedy_only.generate(req_greedy)
+    assert list(res_only.token_ids) == list(res_ref.token_ids)
+    with pytest.raises(ValueError, match="target_step_fn"):
+        engine_greedy_only.generate(req_stoch)

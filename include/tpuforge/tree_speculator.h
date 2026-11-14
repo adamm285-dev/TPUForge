@@ -106,6 +106,12 @@ public:
         size_t vocab_size
     );
 
+    static TreeVerificationResult verify_greedy_tokens(
+        const SystolicTree& tree,
+        const int32_t* target_argmax_tokens,
+        size_t vocab_size
+    );
+
     static TreeVerificationResult verify_stochastic(
         const SystolicTree& tree,
         const float* target_logits_128,
