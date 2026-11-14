@@ -34,6 +34,20 @@ if sys.platform == "win32":
 
 import _tpuforge_ext as tpu
 
+from benchmarks.quantization_jax import (
+    LayerScanWeights,
+    TargetWeightsTuple,
+    normalize_weight_quant,
+    place_np_sharded_preserved,
+    pytree_nbytes,
+    quant_np_dtype,
+    quantize_and_place_2d,
+    quantize_np_per_channel,
+    scale_spec_for_weight,
+    split_np_shard,
+    systolic_linear,
+)
+
 TILE_SIZE = 128
 VALID_TILE_SIZES = (128, 256)
 _MASK_BLOCK_VAL = -1e9
@@ -148,6 +162,7 @@ _SAFETENSORS_DTYPES: dict[str, Any] = {
     "F64": np.float64,
     "I8": np.int8,
     "U8": np.uint8,
+    "F8_E4M3": ml_dtypes.float8_e4m3fn,
     "I16": np.int16,
     "I32": np.int32,
     "I64": np.int64,
@@ -394,28 +409,7 @@ def _read_indexed_tensor(
     return arr.copy()
 
 
-def _split_tensor_shard(
-    arr: np.ndarray,
-    spec: P,
-    rank: int,
-    tp_size: int,
-) -> np.ndarray:
-    """Slice local Megatron TP shard along the axis annotated with 'tp'."""
-    if tp_size <= 1:
-        return np.ascontiguousarray(arr)
-    tp_axes = [ax for ax, name in enumerate(spec) if name == "tp"]
-    if not tp_axes:
-        return np.ascontiguousarray(arr)
-    if len(tp_axes) != 1:
-        raise ValueError(f"Expected at most 1 'tp' axis in PartitionSpec {spec}")
-    ax = tp_axes[0]
-    dim_size = arr.shape[ax]
-    if dim_size % tp_size != 0:
-        raise ValueError(f"Axis {ax} size {dim_size} not divisible by tp_size={tp_size}")
-    chunk = dim_size // tp_size
-    sl = [slice(None)] * arr.ndim
-    sl[ax] = slice(rank * chunk, (rank + 1) * chunk)
-    return np.ascontiguousarray(arr[tuple(sl)])
+_split_tensor_shard = split_np_shard
 
 
 def _jnp_to_numpy_dtype(dtype: jnp.dtype) -> Any:
@@ -428,7 +422,7 @@ def _jnp_to_numpy_dtype(dtype: jnp.dtype) -> Any:
 
 @dataclass
 class QwenWeights:
-    """Stacked (optionally TP-sharded) JAX device arrays for fast jax.lax.scan execution."""
+    """Stacked (optionally TP-sharded and INT8/FP8-quantized) JAX device arrays for lax.scan."""
 
     embed: jax.Array
     final_norm: jax.Array
@@ -448,6 +442,78 @@ class QwenWeights:
     mesh: Mesh | None = None
     q_norm: jax.Array | None = None
     k_norm: jax.Array | None = None
+    weight_quant: str = "none"
+    lm_head_scale: jax.Array | None = None
+    wq_scale: jax.Array | None = None
+    wk_scale: jax.Array | None = None
+    wv_scale: jax.Array | None = None
+    wo_scale: jax.Array | None = None
+    w_gate_scale: jax.Array | None = None
+    w_up_scale: jax.Array | None = None
+    w_down_scale: jax.Array | None = None
+
+    def to_layer_scan_weights(self) -> LayerScanWeights:
+        """Pack stacked per-layer arrays and optional scales for jax.lax.scan."""
+        return LayerScanWeights(
+            in_norm=self.in_norm,
+            post_norm=self.post_norm,
+            wq=self.wq,
+            wq_scale=self.wq_scale,
+            bq=self.bq,
+            wk=self.wk,
+            wk_scale=self.wk_scale,
+            bk=self.bk,
+            wv=self.wv,
+            wv_scale=self.wv_scale,
+            bv=self.bv,
+            wo=self.wo,
+            wo_scale=self.wo_scale,
+            w_gate=self.w_gate,
+            w_gate_scale=self.w_gate_scale,
+            w_up=self.w_up,
+            w_up_scale=self.w_up_scale,
+            w_down=self.w_down,
+            w_down_scale=self.w_down_scale,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+        )
+
+    def to_target_weights_tuple(self) -> TargetWeightsTuple:
+        """Pack all target device arrays into an explicit constant-free pytree."""
+        return TargetWeightsTuple(
+            embed=self.embed,
+            final_norm=self.final_norm,
+            lm_head=self.lm_head,
+            lm_head_scale=self.lm_head_scale,
+            layers=self.to_layer_scan_weights(),
+        )
+
+    def total_bytes(self) -> int:
+        """Return total byte footprint across all target weights and scales."""
+        return pytree_nbytes(self.to_target_weights_tuple())
+
+    def linear_weight_bytes(self) -> int:
+        """Return byte footprint of projection/lm_head matrices and per-channel scales."""
+        return pytree_nbytes(
+            (
+                self.lm_head,
+                self.lm_head_scale,
+                self.wq,
+                self.wq_scale,
+                self.wk,
+                self.wk_scale,
+                self.wv,
+                self.wv_scale,
+                self.wo,
+                self.wo_scale,
+                self.w_gate,
+                self.w_gate_scale,
+                self.w_up,
+                self.w_up_scale,
+                self.w_down,
+                self.w_down_scale,
+            )
+        )
 
     @classmethod
     def from_numpy_dict(
@@ -456,58 +522,85 @@ class QwenWeights:
         config: QwenConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
+        weight_quant: str = "none",
     ) -> QwenWeights:
+        norm_quant = normalize_weight_quant(weight_quant)
         np_dtype = _jnp_to_numpy_dtype(dtype)
         tp_size = mesh.size if mesh is not None else 1
 
-        def place_sharded_from_host(full_np: np.ndarray, spec: P) -> jax.Array:
-            if mesh is None:
-                return jax.device_put(jnp.asarray(full_np, dtype=dtype))
-            sharding = NamedSharding(mesh, spec)
-            local_devs = set(mesh.local_devices)
-            shards = []
-            for dev in mesh.devices.flat:
-                if dev not in local_devs:
-                    continue
-                rank = list(mesh.devices.flat).index(dev)
-                part = _split_tensor_shard(full_np, spec, rank, tp_size)
-                shards.append(jax.device_put(jnp.asarray(part, dtype=np_dtype), dev))
-            return jax.make_array_from_single_device_arrays(full_np.shape, sharding, shards)
+        def to_jnp(arr: np.ndarray, spec: P | None = None) -> jax.Array:
+            casted = np.asarray(arr, dtype=np_dtype)
+            return place_np_sharded_preserved(casted, P() if spec is None else spec, mesh)
 
-        def to_jnp(arr: np.ndarray, transpose: bool = False, spec: P | None = None) -> jax.Array:
-            if transpose:
-                arr = np.ascontiguousarray(arr.T)
-            return place_sharded_from_host(arr, P() if spec is None else spec)
-
-        def stack_layer(suffix: str, transpose: bool = False, spec: P | None = None) -> jax.Array:
+        def stack_layer(suffix: str, spec: P | None = None) -> jax.Array:
             items = []
             for i in range(config.num_hidden_layers):
                 key = f"model.layers.{i}.{suffix}"
                 if key not in raw:
                     raise KeyError(f"Missing tensor {key!r} in safetensors checkpoint")
-                arr = raw[key]
-                if transpose:
-                    arr = np.ascontiguousarray(arr.T)
-                items.append(arr)
-            return place_sharded_from_host(np.stack(items, axis=0), P() if spec is None else spec)
+                items.append(raw[key])
+            return to_jnp(np.stack(items, axis=0), spec=spec)
 
-        def stack_layer_optional(
-            suffix: str, transpose: bool = False, spec: P | None = None
-        ) -> jax.Array | None:
+        def stack_layer_optional(suffix: str, spec: P | None = None) -> jax.Array | None:
             if f"model.layers.0.{suffix}" not in raw:
                 return None
-            return stack_layer(suffix, transpose=transpose, spec=spec)
+            return stack_layer(suffix, spec=spec)
+
+        def stack_linear(suffix: str, spec: P) -> tuple[jax.Array, jax.Array | None]:
+            if norm_quant == "none":
+                items = []
+                for i in range(config.num_hidden_layers):
+                    key = f"model.layers.{i}.{suffix}"
+                    if key not in raw:
+                        raise KeyError(f"Missing tensor {key!r} in safetensors checkpoint")
+                    items.append(np.ascontiguousarray(raw[key].T))
+                return to_jnp(np.stack(items, axis=0), spec=spec), None
+
+            q_items = []
+            s_items = []
+            for i in range(config.num_hidden_layers):
+                key = f"model.layers.{i}.{suffix}"
+                if key not in raw:
+                    raise KeyError(f"Missing tensor {key!r} in safetensors checkpoint")
+                q_i, s_i = quantize_np_per_channel(np.ascontiguousarray(raw[key].T), norm_quant)
+                q_items.append(q_i)
+                s_items.append(s_i)
+            q_dev = place_np_sharded_preserved(np.stack(q_items, axis=0), spec, mesh)
+            s_dev = place_np_sharded_preserved(
+                np.stack(s_items, axis=0), scale_spec_for_weight(spec), mesh
+            )
+            return q_dev, s_dev
 
         lm_spec = P(None, "tp") if (tp_size > 1 and config.vocab_size % tp_size == 0) else P()
         embed_np = raw["model.embed_tokens.weight"]
-        embed = to_jnp(embed_np, transpose=False, spec=P())
-        final_norm = to_jnp(raw["model.norm.weight"], transpose=False, spec=P())
+        embed = to_jnp(embed_np, spec=P())
+        final_norm = to_jnp(raw["model.norm.weight"], spec=P())
         if "lm_head.weight" in raw:
-            lm_head = to_jnp(raw["lm_head.weight"], transpose=True, spec=lm_spec)
+            lm_head, lm_head_scale = quantize_and_place_2d(
+                np.ascontiguousarray(raw["lm_head.weight"].T),
+                lm_spec,
+                mesh,
+                norm_quant,
+                active_np_dtype=np_dtype,
+            )
         elif config.tie_word_embeddings:
-            lm_head = to_jnp(embed_np, transpose=True, spec=lm_spec)
+            lm_head, lm_head_scale = quantize_and_place_2d(
+                np.ascontiguousarray(embed_np.T),
+                lm_spec,
+                mesh,
+                norm_quant,
+                active_np_dtype=np_dtype,
+            )
         else:
             raise KeyError("lm_head.weight missing and tie_word_embeddings is False")
+
+        wq, wq_scale = stack_linear("self_attn.q_proj.weight", P(None, None, "tp"))
+        wk, wk_scale = stack_linear("self_attn.k_proj.weight", P(None, None, "tp"))
+        wv, wv_scale = stack_linear("self_attn.v_proj.weight", P(None, None, "tp"))
+        wo, wo_scale = stack_linear("self_attn.o_proj.weight", P(None, "tp", None))
+        w_gate, w_gate_scale = stack_linear("mlp.gate_proj.weight", P(None, None, "tp"))
+        w_up, w_up_scale = stack_linear("mlp.up_proj.weight", P(None, None, "tp"))
+        w_down, w_down_scale = stack_linear("mlp.down_proj.weight", P(None, "tp", None))
 
         return cls(
             embed=embed,
@@ -515,19 +608,28 @@ class QwenWeights:
             lm_head=lm_head,
             in_norm=stack_layer("input_layernorm.weight", spec=P()),
             post_norm=stack_layer("post_attention_layernorm.weight", spec=P()),
-            wq=stack_layer("self_attn.q_proj.weight", transpose=True, spec=P(None, None, "tp")),
+            wq=wq,
             bq=stack_layer_optional("self_attn.q_proj.bias", spec=P(None, "tp")),
-            wk=stack_layer("self_attn.k_proj.weight", transpose=True, spec=P(None, None, "tp")),
+            wk=wk,
             bk=stack_layer_optional("self_attn.k_proj.bias", spec=P(None, "tp")),
-            wv=stack_layer("self_attn.v_proj.weight", transpose=True, spec=P(None, None, "tp")),
+            wv=wv,
             bv=stack_layer_optional("self_attn.v_proj.bias", spec=P(None, "tp")),
-            wo=stack_layer("self_attn.o_proj.weight", transpose=True, spec=P(None, "tp", None)),
-            w_gate=stack_layer("mlp.gate_proj.weight", transpose=True, spec=P(None, None, "tp")),
-            w_up=stack_layer("mlp.up_proj.weight", transpose=True, spec=P(None, None, "tp")),
-            w_down=stack_layer("mlp.down_proj.weight", transpose=True, spec=P(None, "tp", None)),
+            wo=wo,
+            w_gate=w_gate,
+            w_up=w_up,
+            w_down=w_down,
             mesh=mesh,
             q_norm=stack_layer_optional("self_attn.q_norm.weight", spec=P()),
             k_norm=stack_layer_optional("self_attn.k_norm.weight", spec=P()),
+            weight_quant=norm_quant,
+            lm_head_scale=lm_head_scale,
+            wq_scale=wq_scale,
+            wk_scale=wk_scale,
+            wv_scale=wv_scale,
+            wo_scale=wo_scale,
+            w_gate_scale=w_gate_scale,
+            w_up_scale=w_up_scale,
+            w_down_scale=w_down_scale,
         )
 
     @classmethod
@@ -537,45 +639,28 @@ class QwenWeights:
         config: QwenConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
+        weight_quant: str = "none",
     ) -> QwenWeights:
         """Stream tensors shard-by-shard from disk directly onto TPU HBM with low host RAM."""
+        norm_quant = normalize_weight_quant(weight_quant)
         tensor_loc = _iter_safetensors_index(model_dir)
         np_dtype = _jnp_to_numpy_dtype(dtype)
         tp_size = mesh.size if mesh is not None else 1
 
-        def place_tensor(full_np: np.ndarray, spec: P) -> jax.Array:
-            if mesh is None:
-                return jax.device_put(jnp.asarray(full_np, dtype=dtype))
-            sharding = NamedSharding(mesh, spec)
-            local_devs = set(mesh.local_devices)
-            all_devs = list(mesh.devices.flat)
-            shards = []
-            for dev in all_devs:
-                if dev not in local_devs:
-                    continue
-                rank = all_devs.index(dev)
-                part = _split_tensor_shard(full_np, spec, rank, tp_size)
-                shards.append(jax.device_put(jnp.asarray(part, dtype=np_dtype), dev))
-            return jax.make_array_from_single_device_arrays(full_np.shape, sharding, shards)
-
         with _MappedSafetensorsReader() as reader:
-            def stream_stacked_layer(suffix: str, transpose: bool, spec: P) -> jax.Array:
+            def stream_stacked_vec(suffix: str, spec: P) -> jax.Array:
                 num_layers = config.num_hidden_layers
                 key0 = f"model.layers.0.{suffix}"
                 if key0 not in tensor_loc:
                     raise KeyError(f"Missing tensor {key0!r} in safetensors checkpoint")
-                raw_shape0 = tensor_loc[key0][2]
-                layer_shape = tuple(reversed(raw_shape0)) if transpose else raw_shape0
+                layer_shape = tensor_loc[key0][2]
                 full_shape = (num_layers,) + layer_shape
 
                 if mesh is None:
                     stacked = np.empty(full_shape, dtype=np_dtype)
                     for i in range(num_layers):
                         key = f"model.layers.{i}.{suffix}"
-                        arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
-                        if transpose:
-                            arr = np.ascontiguousarray(arr.T)
-                        stacked[i] = arr
+                        stacked[i] = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
                     out = jax.device_put(jnp.asarray(stacked, dtype=dtype))
                     del stacked
                     return out
@@ -583,12 +668,7 @@ class QwenWeights:
                 sharding = NamedSharding(mesh, spec)
                 local_devs = set(mesh.local_devices)
                 all_devs = list(mesh.devices.flat)
-                sample_shard = _split_tensor_shard(
-                    np.empty(full_shape, dtype=np_dtype) if tp_size == 1 else np.empty((1,) + layer_shape, dtype=np_dtype),
-                    spec,
-                    0,
-                    tp_size,
-                )
+                sample_shard = split_np_shard(np.empty((1,) + layer_shape, dtype=np_dtype), spec, 0, tp_size)
                 shard_layer_shape = sample_shard.shape[1:]
                 del sample_shard
 
@@ -598,63 +678,204 @@ class QwenWeights:
                         continue
                     rank = all_devs.index(dev)
                     rank_buf = np.empty((num_layers,) + shard_layer_shape, dtype=np_dtype)
+                    layer_spec = P(*spec[1:])
                     for i in range(num_layers):
                         key = f"model.layers.{i}.{suffix}"
                         arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
-                        if transpose:
-                            arr = np.ascontiguousarray(arr.T)
-                        layer_spec = P(*spec[1:])
-                        rank_buf[i] = _split_tensor_shard(arr, layer_spec, rank, tp_size)
+                        rank_buf[i] = split_np_shard(arr, layer_spec, rank, tp_size)
                         del arr
-                    device_arrays.append(jax.device_put(jnp.asarray(rank_buf, dtype=np_dtype), dev))
+                    device_arrays.append(jax.device_put(jnp.asarray(rank_buf), dev))
                     del rank_buf
                 return jax.make_array_from_single_device_arrays(full_shape, sharding, device_arrays)
 
-            def stream_stacked_layer_optional(
-                suffix: str, transpose: bool, spec: P
-            ) -> jax.Array | None:
+            def stream_stacked_vec_optional(suffix: str, spec: P) -> jax.Array | None:
                 if f"model.layers.0.{suffix}" not in tensor_loc:
                     return None
-                return stream_stacked_layer(suffix, transpose, spec)
+                return stream_stacked_vec(suffix, spec)
+
+            def stream_stacked_linear(
+                suffix: str,
+                spec: P,
+            ) -> tuple[jax.Array, jax.Array | None]:
+                num_layers = config.num_hidden_layers
+                key0 = f"model.layers.0.{suffix}"
+                if key0 not in tensor_loc:
+                    raise KeyError(f"Missing tensor {key0!r} in safetensors checkpoint")
+                layer_shape = tuple(reversed(tensor_loc[key0][2]))
+                full_shape = (num_layers,) + layer_shape
+
+                if norm_quant == "none":
+                    if mesh is None:
+                        stacked = np.empty(full_shape, dtype=np_dtype)
+                        for i in range(num_layers):
+                            key = f"model.layers.{i}.{suffix}"
+                            arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
+                            stacked[i] = np.ascontiguousarray(arr.T)
+                            del arr
+                        out = jax.device_put(jnp.asarray(stacked, dtype=dtype))
+                        del stacked
+                        return out, None
+
+                    sharding = NamedSharding(mesh, spec)
+                    local_devs = set(mesh.local_devices)
+                    all_devs = list(mesh.devices.flat)
+                    sample_shard = split_np_shard(
+                        np.empty((1,) + layer_shape, dtype=np_dtype), spec, 0, tp_size
+                    )
+                    shard_layer_shape = sample_shard.shape[1:]
+                    del sample_shard
+                    layer_spec = P(*spec[1:])
+
+                    device_arrays = []
+                    for dev in all_devs:
+                        if dev not in local_devs:
+                            continue
+                        rank = all_devs.index(dev)
+                        rank_buf = np.empty((num_layers,) + shard_layer_shape, dtype=np_dtype)
+                        for i in range(num_layers):
+                            key = f"model.layers.{i}.{suffix}"
+                            arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
+                            rank_buf[i] = split_np_shard(
+                                np.ascontiguousarray(arr.T), layer_spec, rank, tp_size
+                            )
+                            del arr
+                        device_arrays.append(jax.device_put(jnp.asarray(rank_buf), dev))
+                        del rank_buf
+                    return jax.make_array_from_single_device_arrays(
+                        full_shape, sharding, device_arrays
+                    ), None
+
+                q_dtype = quant_np_dtype(norm_quant)
+                scale_spec = scale_spec_for_weight(spec)
+                full_scale_shape = (num_layers, layer_shape[-1])
+
+                if mesh is None:
+                    q_stacked = np.empty(full_shape, dtype=q_dtype)
+                    s_stacked = np.empty(full_scale_shape, dtype=np.float32)
+                    for i in range(num_layers):
+                        key = f"model.layers.{i}.{suffix}"
+                        raw_w = _read_indexed_tensor(tensor_loc[key], None, reader=reader)
+                        q_i, s_i = quantize_np_per_channel(np.ascontiguousarray(raw_w.T), norm_quant)
+                        del raw_w
+                        q_stacked[i] = q_i
+                        s_stacked[i] = s_i
+                    q_dev = jax.device_put(jnp.asarray(q_stacked))
+                    s_dev = jax.device_put(jnp.asarray(s_stacked))
+                    del q_stacked, s_stacked
+                    return q_dev, s_dev
+
+                w_sharding = NamedSharding(mesh, spec)
+                s_sharding = NamedSharding(mesh, scale_spec)
+                local_devs = set(mesh.local_devices)
+                all_devs = list(mesh.devices.flat)
+                layer_spec = P(*spec[1:])
+                layer_scale_spec = scale_spec_for_weight(layer_spec)
+                sample_w = split_np_shard(np.empty((1,) + layer_shape, dtype=q_dtype), spec, 0, tp_size)
+                sample_s = split_np_shard(
+                    np.empty((1, layer_shape[-1]), dtype=np.float32), scale_spec, 0, tp_size
+                )
+                shard_w_shape = sample_w.shape[1:]
+                shard_s_shape = sample_s.shape[1:]
+                del sample_w, sample_s
+
+                w_arrays = []
+                s_arrays = []
+                for dev in all_devs:
+                    if dev not in local_devs:
+                        continue
+                    rank = all_devs.index(dev)
+                    rank_w_buf = np.empty((num_layers,) + shard_w_shape, dtype=q_dtype)
+                    rank_s_buf = np.empty((num_layers,) + shard_s_shape, dtype=np.float32)
+                    for i in range(num_layers):
+                        key = f"model.layers.{i}.{suffix}"
+                        raw_w = _read_indexed_tensor(tensor_loc[key], None, reader=reader)
+                        q_i, s_i = quantize_np_per_channel(np.ascontiguousarray(raw_w.T), norm_quant)
+                        del raw_w
+                        rank_w_buf[i] = split_np_shard(q_i, layer_spec, rank, tp_size)
+                        rank_s_buf[i] = split_np_shard(s_i, layer_scale_spec, rank, tp_size)
+                        del q_i, s_i
+                    w_arrays.append(jax.device_put(jnp.asarray(rank_w_buf), dev))
+                    s_arrays.append(jax.device_put(jnp.asarray(rank_s_buf), dev))
+                    del rank_w_buf, rank_s_buf
+                return (
+                    jax.make_array_from_single_device_arrays(full_shape, w_sharding, w_arrays),
+                    jax.make_array_from_single_device_arrays(full_scale_shape, s_sharding, s_arrays),
+                )
 
             lm_spec = P(None, "tp") if (tp_size > 1 and config.vocab_size % tp_size == 0) else P()
-            embed_np = _read_indexed_tensor(tensor_loc["model.embed_tokens.weight"], np_dtype, reader=reader)
-            embed = place_tensor(embed_np, P())
+            embed_raw_dtype = None if norm_quant != "none" else np_dtype
+            embed_np = _read_indexed_tensor(
+                tensor_loc["model.embed_tokens.weight"], embed_raw_dtype, reader=reader
+            )
+            embed = place_np_sharded_preserved(np.asarray(embed_np, dtype=np_dtype), P(), mesh)
             if "lm_head.weight" in tensor_loc:
                 del embed_np
-                lm_np = _read_indexed_tensor(tensor_loc["lm_head.weight"], np_dtype, reader=reader)
-                lm_head = place_tensor(np.ascontiguousarray(lm_np.T), lm_spec)
+                lm_np = _read_indexed_tensor(
+                    tensor_loc["lm_head.weight"], embed_raw_dtype, reader=reader
+                )
+                lm_head, lm_head_scale = quantize_and_place_2d(
+                    np.ascontiguousarray(lm_np.T),
+                    lm_spec,
+                    mesh,
+                    norm_quant,
+                    active_np_dtype=np_dtype,
+                )
                 del lm_np
             elif config.tie_word_embeddings:
-                lm_head = place_tensor(np.ascontiguousarray(embed_np.T), lm_spec)
+                lm_head, lm_head_scale = quantize_and_place_2d(
+                    np.ascontiguousarray(embed_np.T),
+                    lm_spec,
+                    mesh,
+                    norm_quant,
+                    active_np_dtype=np_dtype,
+                )
                 del embed_np
             else:
                 del embed_np
                 raise KeyError("lm_head.weight missing and tie_word_embeddings is False")
 
-            final_norm_np = _read_indexed_tensor(tensor_loc["model.norm.weight"], np_dtype, reader=reader)
-            final_norm = place_tensor(final_norm_np, P())
+            final_norm_np = _read_indexed_tensor(
+                tensor_loc["model.norm.weight"], np_dtype, reader=reader
+            )
+            final_norm = place_np_sharded_preserved(final_norm_np, P(), mesh)
             del final_norm_np
+
+            wq, wq_scale = stream_stacked_linear("self_attn.q_proj.weight", P(None, None, "tp"))
+            wk, wk_scale = stream_stacked_linear("self_attn.k_proj.weight", P(None, None, "tp"))
+            wv, wv_scale = stream_stacked_linear("self_attn.v_proj.weight", P(None, None, "tp"))
+            wo, wo_scale = stream_stacked_linear("self_attn.o_proj.weight", P(None, "tp", None))
+            w_gate, w_gate_scale = stream_stacked_linear("mlp.gate_proj.weight", P(None, None, "tp"))
+            w_up, w_up_scale = stream_stacked_linear("mlp.up_proj.weight", P(None, None, "tp"))
+            w_down, w_down_scale = stream_stacked_linear("mlp.down_proj.weight", P(None, "tp", None))
 
             return cls(
                 embed=embed,
                 final_norm=final_norm,
                 lm_head=lm_head,
-                in_norm=stream_stacked_layer("input_layernorm.weight", False, P()),
-                post_norm=stream_stacked_layer("post_attention_layernorm.weight", False, P()),
-                wq=stream_stacked_layer("self_attn.q_proj.weight", True, P(None, None, "tp")),
-                bq=stream_stacked_layer_optional("self_attn.q_proj.bias", False, P(None, "tp")),
-                wk=stream_stacked_layer("self_attn.k_proj.weight", True, P(None, None, "tp")),
-                bk=stream_stacked_layer_optional("self_attn.k_proj.bias", False, P(None, "tp")),
-                wv=stream_stacked_layer("self_attn.v_proj.weight", True, P(None, None, "tp")),
-                bv=stream_stacked_layer_optional("self_attn.v_proj.bias", False, P(None, "tp")),
-                wo=stream_stacked_layer("self_attn.o_proj.weight", True, P(None, "tp", None)),
-                w_gate=stream_stacked_layer("mlp.gate_proj.weight", True, P(None, None, "tp")),
-                w_up=stream_stacked_layer("mlp.up_proj.weight", True, P(None, None, "tp")),
-                w_down=stream_stacked_layer("mlp.down_proj.weight", True, P(None, "tp", None)),
+                in_norm=stream_stacked_vec("input_layernorm.weight", P()),
+                post_norm=stream_stacked_vec("post_attention_layernorm.weight", P()),
+                wq=wq,
+                bq=stream_stacked_vec_optional("self_attn.q_proj.bias", P(None, "tp")),
+                wk=wk,
+                bk=stream_stacked_vec_optional("self_attn.k_proj.bias", P(None, "tp")),
+                wv=wv,
+                bv=stream_stacked_vec_optional("self_attn.v_proj.bias", P(None, "tp")),
+                wo=wo,
+                w_gate=w_gate,
+                w_up=w_up,
+                w_down=w_down,
                 mesh=mesh,
-                q_norm=stream_stacked_layer_optional("self_attn.q_norm.weight", False, P()),
-                k_norm=stream_stacked_layer_optional("self_attn.k_norm.weight", False, P()),
+                q_norm=stream_stacked_vec_optional("self_attn.q_norm.weight", P()),
+                k_norm=stream_stacked_vec_optional("self_attn.k_norm.weight", P()),
+                weight_quant=norm_quant,
+                lm_head_scale=lm_head_scale,
+                wq_scale=wq_scale,
+                wk_scale=wk_scale,
+                wv_scale=wv_scale,
+                wo_scale=wo_scale,
+                w_gate_scale=w_gate_scale,
+                w_up_scale=w_up_scale,
+                w_down_scale=w_down_scale,
             )
 
 
@@ -800,52 +1021,47 @@ def _linear(
     x: jax.Array,
     w: jax.Array,
     b: jax.Array | None = None,
+    w_scale: jax.Array | None = None,
     out_dtype: Any | None = None,
 ) -> jax.Array:
-    target_dtype = x.dtype if out_dtype is None else out_dtype
-    if x.dtype in (jnp.bfloat16, jnp.float16):
-        out = jnp.matmul(x, w, preferred_element_type=jnp.float32)
-        if b is not None:
-            out = out + b.astype(jnp.float32)
-        return out.astype(target_dtype)
-    out = jnp.matmul(x, w, precision=jax.lax.Precision.HIGHEST)
-    if b is not None:
-        out = out + b
-    return out.astype(target_dtype) if out.dtype != target_dtype else out
+    return systolic_linear(x, w, b=b, w_scale=w_scale, out_dtype=out_dtype)
 
 
 def _qwen_qkv_proj(
     x: jax.Array,
-    lw: tuple[jax.Array | None, ...],
+    lw: LayerScanWeights,
     positions: jax.Array,
     cfg: QwenConfig,
     head_sharding: NamedSharding | None = None,
     kv_head_sharding: NamedSharding | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    in_n, _, wq, bq, wk, bk, wv, bv, *_ = lw
-    q_n = lw[12] if len(lw) >= 16 else None
-    k_n = lw[13] if len(lw) >= 16 else None
     seq_q = x.shape[0]
-    h = _rms_norm(x, in_n, cfg.rms_norm_eps)
-    q_proj = _linear(h, wq, bq).reshape(seq_q, cfg.num_attention_heads, cfg.head_dim)
-    if q_n is not None:
-        q_proj = _rms_norm(q_proj, q_n, cfg.rms_norm_eps)
+    h = _rms_norm(x, lw.in_norm, cfg.rms_norm_eps)
+    q_proj = _linear(h, lw.wq, lw.bq, w_scale=lw.wq_scale).reshape(
+        seq_q, cfg.num_attention_heads, cfg.head_dim
+    )
+    if lw.q_norm is not None:
+        q_proj = _rms_norm(q_proj, lw.q_norm, cfg.rms_norm_eps)
     q = _apply_qwen_rope(
         q_proj,
         positions,
         cfg.head_dim,
         cfg.rope_theta,
     )
-    k_proj = _linear(h, wk, bk).reshape(seq_q, cfg.num_key_value_heads, cfg.head_dim)
-    if k_n is not None:
-        k_proj = _rms_norm(k_proj, k_n, cfg.rms_norm_eps)
+    k_proj = _linear(h, lw.wk, lw.bk, w_scale=lw.wk_scale).reshape(
+        seq_q, cfg.num_key_value_heads, cfg.head_dim
+    )
+    if lw.k_norm is not None:
+        k_proj = _rms_norm(k_proj, lw.k_norm, cfg.rms_norm_eps)
     k_new = _apply_qwen_rope(
         k_proj,
         positions,
         cfg.head_dim,
         cfg.rope_theta,
     )
-    v_new = _linear(h, wv, bv).reshape(seq_q, cfg.num_key_value_heads, cfg.head_dim)
+    v_new = _linear(h, lw.wv, lw.bv, w_scale=lw.wv_scale).reshape(
+        seq_q, cfg.num_key_value_heads, cfg.head_dim
+    )
     if head_sharding is not None:
         q = jax.lax.with_sharding_constraint(q, head_sharding)
     if kv_head_sharding is not None:
@@ -857,17 +1073,18 @@ def _qwen_qkv_proj(
 def _qwen_block_post_attn(
     x: jax.Array,
     attn_out: jax.Array,
-    lw: tuple[jax.Array, ...],
+    lw: LayerScanWeights,
     cfg: QwenConfig,
     rep_sharding: NamedSharding | None = None,
 ) -> jax.Array:
-    _, post_n, _, _, _, _, _, _, wo, wg, wu, wd, *_ = lw
-    proj = _linear(attn_out, wo)
+    proj = _linear(attn_out, lw.wo, w_scale=lw.wo_scale)
     if rep_sharding is not None:
         proj = jax.lax.with_sharding_constraint(proj, rep_sharding)
     x = x + proj
-    h2 = _rms_norm(x, post_n, cfg.rms_norm_eps)
-    mlp_out = _linear(jax.nn.silu(_linear(h2, wg)) * _linear(h2, wu), wd)
+    h2 = _rms_norm(x, lw.post_norm, cfg.rms_norm_eps)
+    gate = _linear(h2, lw.w_gate, w_scale=lw.w_gate_scale)
+    up = _linear(h2, lw.w_up, w_scale=lw.w_up_scale)
+    mlp_out = _linear(jax.nn.silu(gate) * up, lw.w_down, w_scale=lw.w_down_scale)
     if rep_sharding is not None:
         mlp_out = jax.lax.with_sharding_constraint(mlp_out, rep_sharding)
     return x + mlp_out
@@ -918,6 +1135,8 @@ class QwenBenchmarkRunner:
         self.mesh = resolved_mesh
         self.tp_size = resolved_mesh.size if resolved_mesh is not None else 1
         self.dtype = weights.embed.dtype
+        self.weight_quant = weights.weight_quant
+        self.model_hbm_bytes = weights.total_bytes()
 
         if resolved_mesh is not None:
             self.rep_sharding: NamedSharding | None = NamedSharding(resolved_mesh, P())
@@ -958,25 +1177,7 @@ class QwenBenchmarkRunner:
         kv_head_sharding = self.kv_head_sharding
         kv_cache_sharding = self.kv_cache_sharding
 
-        self._weights_tuple: tuple[jax.Array | None, ...] = (
-            w.embed,
-            w.final_norm,
-            w.lm_head,
-            w.in_norm,
-            w.post_norm,
-            w.wq,
-            w.bq,
-            w.wk,
-            w.bk,
-            w.wv,
-            w.bv,
-            w.wo,
-            w.w_gate,
-            w.w_up,
-            w.w_down,
-            w.q_norm,
-            w.k_norm,
-        )
+        self._weights_tuple: TargetWeightsTuple = w.to_target_weights_tuple()
         del w
 
         def _empty_kv_cache() -> tuple[jax.Array, jax.Array]:
@@ -992,16 +1193,15 @@ class QwenBenchmarkRunner:
 
         @jax.jit
         def vanilla_prefill_jit(
-            wt: tuple[jax.Array, ...],
+            wt: TargetWeightsTuple,
             prompt_ids: jax.Array,
             k_cache: jax.Array,
             v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             self.vanilla_prefill_compile_count += 1
-            embed, final_norm, lm_head, *layer_weights = wt
             seq_p = prompt_ids.shape[0]
             positions = jnp.arange(seq_p, dtype=jnp.int32)
-            x0 = embed[prompt_ids]
+            x0 = wt.embed[prompt_ids]
             if rep_sharding is not None:
                 x0 = jax.lax.with_sharding_constraint(x0, rep_sharding)
             causal = jnp.where(
@@ -1010,10 +1210,10 @@ class QwenBenchmarkRunner:
                 _MASK_BLOCK_VAL,
             ).astype(jnp.float32)
 
-            def body(x: jax.Array, lw: tuple[jax.Array, ...]):
+            def body(x: jax.Array, scan_in: tuple[LayerScanWeights, jax.Array, jax.Array]):
+                lw, kc, vc = scan_in
                 if rep_sharding is not None:
                     x = jax.lax.with_sharding_constraint(x, rep_sharding)
-                kc, vc = lw[-2], lw[-1]
                 q, k_new, v_new = _qwen_qkv_proj(
                     x, lw, positions, cfg, head_sharding, kv_head_sharding
                 )
@@ -1024,24 +1224,25 @@ class QwenBenchmarkRunner:
                 )
                 return _qwen_block_post_attn(x, attn_out, lw, cfg, rep_sharding), (kc, vc)
 
-            x_final, (k_out, v_out) = jax.lax.scan(body, x0, (*layer_weights, k_cache, v_cache))
-            last_h = _rms_norm(x_final[-1:], final_norm, cfg.rms_norm_eps)
-            logits = _linear(last_h, lm_head, out_dtype=jnp.float32)[0]
+            x_final, (k_out, v_out) = jax.lax.scan(body, x0, (wt.layers, k_cache, v_cache))
+            last_h = _rms_norm(x_final[-1:], wt.final_norm, cfg.rms_norm_eps)
+            logits = _linear(
+                last_h, wt.lm_head, w_scale=wt.lm_head_scale, out_dtype=jnp.float32
+            )[0]
             if rep_sharding is not None:
                 logits = jax.lax.with_sharding_constraint(logits, rep_sharding)
             return logits, k_out, v_out
 
         @jax.jit
         def vanilla_decode_step_jit(
-            wt: tuple[jax.Array, ...],
+            wt: TargetWeightsTuple,
             token_id: jax.Array,
             pos: jax.Array,
             k_cache: jax.Array,
             v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             self.vanilla_decode_compile_count += 1
-            embed, final_norm, lm_head, *layer_weights = wt
-            x0 = embed[token_id].reshape(1, cfg.hidden_size)
+            x0 = wt.embed[token_id].reshape(1, cfg.hidden_size)
             if rep_sharding is not None:
                 x0 = jax.lax.with_sharding_constraint(x0, rep_sharding)
             pos_arr = jnp.asarray([pos], dtype=jnp.int32)
@@ -1051,10 +1252,10 @@ class QwenBenchmarkRunner:
                 _MASK_BLOCK_VAL,
             ).astype(jnp.float32)[None, :]
 
-            def body(x: jax.Array, lw: tuple[jax.Array, ...]):
+            def body(x: jax.Array, scan_in: tuple[LayerScanWeights, jax.Array, jax.Array]):
+                lw, kc, vc = scan_in
                 if rep_sharding is not None:
                     x = jax.lax.with_sharding_constraint(x, rep_sharding)
-                kc, vc = lw[-2], lw[-1]
                 q, k_new, v_new = _qwen_qkv_proj(
                     x, lw, pos_arr, cfg, head_sharding, kv_head_sharding
                 )
@@ -1065,16 +1266,18 @@ class QwenBenchmarkRunner:
                 )
                 return _qwen_block_post_attn(x, attn_out, lw, cfg, rep_sharding), (kc, vc)
 
-            x_final, (k_out, v_out) = jax.lax.scan(body, x0, (*layer_weights, k_cache, v_cache))
-            last_h = _rms_norm(x_final, final_norm, cfg.rms_norm_eps)
-            logits = _linear(last_h, lm_head, out_dtype=jnp.float32)[0]
+            x_final, (k_out, v_out) = jax.lax.scan(body, x0, (wt.layers, k_cache, v_cache))
+            last_h = _rms_norm(x_final, wt.final_norm, cfg.rms_norm_eps)
+            logits = _linear(
+                last_h, wt.lm_head, w_scale=wt.lm_head_scale, out_dtype=jnp.float32
+            )[0]
             if rep_sharding is not None:
                 logits = jax.lax.with_sharding_constraint(logits, rep_sharding)
             return logits, k_out, v_out
 
         @jax.jit
         def static_systolic_tile_step_jit(
-            wt: tuple[jax.Array, ...],
+            wt: TargetWeightsTuple,
             valid_prefix_len: jax.Array,
             token_tile: jax.Array,
             pos_tile: jax.Array,
@@ -1083,8 +1286,7 @@ class QwenBenchmarkRunner:
             v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             self.static_step_compile_count += 1
-            embed, final_norm, lm_head, *layer_weights = wt
-            x0 = embed[token_tile]
+            x0 = wt.embed[token_tile]
             if rep_sharding is not None:
                 x0 = jax.lax.with_sharding_constraint(x0, rep_sharding)
             prefix_allowed = jnp.where(
@@ -1095,10 +1297,10 @@ class QwenBenchmarkRunner:
             prefix_mask = jnp.broadcast_to(prefix_allowed[None, :], (tile_size, max_seq))
             full_mask = jnp.concatenate([prefix_mask, tile_mask], axis=-1)
 
-            def body(x: jax.Array, lw: tuple[jax.Array, ...]):
+            def body(x: jax.Array, scan_in: tuple[LayerScanWeights, jax.Array, jax.Array]):
+                lw, kc, vc = scan_in
                 if rep_sharding is not None:
                     x = jax.lax.with_sharding_constraint(x, rep_sharding)
-                kc, vc = lw[-2], lw[-1]
                 q, k_step, v_step = _qwen_qkv_proj(
                     x, lw, pos_tile, cfg, head_sharding, kv_head_sharding
                 )
@@ -1110,10 +1312,12 @@ class QwenBenchmarkRunner:
                 return _qwen_block_post_attn(x, attn_out, lw, cfg, rep_sharding), (k_step, v_step)
 
             x_final, (step_k_out, step_v_out) = jax.lax.scan(
-                body, x0, (*layer_weights, k_cache, v_cache)
+                body, x0, (wt.layers, k_cache, v_cache)
             )
-            normed = _rms_norm(x_final, final_norm, cfg.rms_norm_eps)
-            logits_tile = _linear(normed, lm_head, out_dtype=jnp.float32)
+            normed = _rms_norm(x_final, wt.final_norm, cfg.rms_norm_eps)
+            logits_tile = _linear(
+                normed, wt.lm_head, w_scale=wt.lm_head_scale, out_dtype=jnp.float32
+            )
             has_nan = jnp.any(jnp.isnan(logits_tile), axis=-1)
             argmax_tokens = jnp.where(
                 has_nan,
@@ -1240,6 +1444,7 @@ class QwenBenchmarkRunner:
                 "decode_compiles": self.vanilla_decode_compile_count,
                 "tile_size": self.tile_size,
                 "tp_size": self.tp_size,
+                "weight_quant": self.weight_quant,
             },
         )
 
@@ -1374,6 +1579,7 @@ class QwenBenchmarkRunner:
                 "total_static_compiles": self.static_step_compile_count,
                 "tile_size": self.tile_size,
                 "tp_size": self.tp_size,
+                "weight_quant": self.weight_quant,
             },
         )
 
@@ -1516,6 +1722,7 @@ class QwenBenchmarkRunner:
                 "total_static_compiles": self.static_step_compile_count,
                 "tile_size": self.tile_size,
                 "tp_size": self.tp_size,
+                "weight_quant": self.weight_quant,
             },
         )
 
@@ -1527,6 +1734,7 @@ def load_qwen_runner(
     tile_size: int | str = "auto",
     tp_size: int | str = "auto",
     enable_xla_cache: bool = True,
+    weight_quant: str = "none",
 ) -> tuple[QwenBenchmarkRunner, Path]:
     """Load config, tokenizer, and streaming safetensors weights into QwenBenchmarkRunner."""
     from tokenizers import Tokenizer
@@ -1543,7 +1751,9 @@ def load_qwen_runner(
 
     dtype = resolve_default_dtype(dtype_name)
     _, mesh = resolve_tp_mesh(tp_size, config=config)
-    weights = QwenWeights.from_model_dir(model_dir, config, dtype=dtype, mesh=mesh)
+    weights = QwenWeights.from_model_dir(
+        model_dir, config, dtype=dtype, mesh=mesh, weight_quant=weight_quant
+    )
     runner = QwenBenchmarkRunner(
         config=config,
         weights=weights,

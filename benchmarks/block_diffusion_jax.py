@@ -16,6 +16,17 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from benchmarks.quantization_jax import (
+    DraftWeightsTuple,
+    LayerScanWeights,
+    TargetWeightsTuple,
+    normalize_weight_quant,
+    place_np_sharded_preserved,
+    quant_np_dtype,
+    quantize_and_place_2d,
+    quantize_np_per_channel,
+    scale_spec_for_weight,
+)
 from benchmarks.qwen_jax import (
     _MASK_BLOCK_VAL,
     QwenBenchmarkRunner,
@@ -171,7 +182,7 @@ def _place_np_sharded(
 
 @dataclass
 class BlockDiffusionWeights:
-    """Stacked (optionally TP-sharded) JAX device arrays for a block-diffusion drafter."""
+    """Stacked (optionally TP-sharded and quantized) JAX arrays for a block-diffusion drafter."""
 
     fc: jax.Array
     hidden_norm: jax.Array
@@ -191,6 +202,51 @@ class BlockDiffusionWeights:
     mesh: Mesh | None = None
     q_norm: jax.Array | None = None
     k_norm: jax.Array | None = None
+    weight_quant: str = "none"
+    fc_scale: jax.Array | None = None
+    wq_scale: jax.Array | None = None
+    wk_scale: jax.Array | None = None
+    wv_scale: jax.Array | None = None
+    wo_scale: jax.Array | None = None
+    w_gate_scale: jax.Array | None = None
+    w_up_scale: jax.Array | None = None
+    w_down_scale: jax.Array | None = None
+
+    def to_layer_scan_weights(self) -> LayerScanWeights:
+        """Pack stacked per-layer drafter weights and optional scales for lax.scan."""
+        return LayerScanWeights(
+            in_norm=self.in_norm,
+            post_norm=self.post_norm,
+            wq=self.wq,
+            wq_scale=self.wq_scale,
+            bq=self.bq,
+            wk=self.wk,
+            wk_scale=self.wk_scale,
+            bk=self.bk,
+            wv=self.wv,
+            wv_scale=self.wv_scale,
+            bv=self.bv,
+            wo=self.wo,
+            wo_scale=self.wo_scale,
+            w_gate=self.w_gate,
+            w_gate_scale=self.w_gate_scale,
+            w_up=self.w_up,
+            w_up_scale=self.w_up_scale,
+            w_down=self.w_down,
+            w_down_scale=self.w_down_scale,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+        )
+
+    def to_draft_weights_tuple(self) -> DraftWeightsTuple:
+        """Pack drafter device arrays into an explicit constant-free pytree."""
+        return DraftWeightsTuple(
+            fc=self.fc,
+            fc_scale=self.fc_scale,
+            hidden_norm=self.hidden_norm,
+            final_norm=self.final_norm,
+            layers=self.to_layer_scan_weights(),
+        )
 
     @classmethod
     def from_numpy_dict(
@@ -199,7 +255,9 @@ class BlockDiffusionWeights:
         config: BlockDiffusionConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
+        weight_quant: str = "none",
     ) -> BlockDiffusionWeights:
+        norm_quant = normalize_weight_quant(weight_quant)
         np_dtype = _jnp_to_numpy_dtype(dtype)
         top_prefix = "" if "fc.weight" in raw else ("model." if "model.fc.weight" in raw else "")
         layer_prefix = (
@@ -208,55 +266,99 @@ class BlockDiffusionWeights:
             else ("model." if "model.layers.0.input_layernorm.weight" in raw else top_prefix)
         )
 
-        def get_top(name: str, transpose: bool = False) -> jax.Array:
+        def get_top_vec(name: str) -> jax.Array:
             key = f"{top_prefix}{name}"
             if key not in raw:
                 raise KeyError(f"Missing block-drafter tensor {key!r}")
-            arr = raw[key]
-            if transpose:
-                arr = np.ascontiguousarray(arr.T)
-            return _place_np_sharded(arr, P(), mesh, dtype, np_dtype)
+            return _place_np_sharded(raw[key], P(), mesh, dtype, np_dtype)
 
-        def stack_layer(suffix: str, transpose: bool = False, spec: P | None = None) -> jax.Array:
+        def get_fc() -> tuple[jax.Array, jax.Array | None]:
+            key = f"{top_prefix}fc.weight"
+            if key not in raw:
+                raise KeyError(f"Missing block-drafter tensor {key!r}")
+            return quantize_and_place_2d(
+                np.ascontiguousarray(raw[key].T), P(), mesh, norm_quant, active_np_dtype=np_dtype
+            )
+
+        def stack_layer(suffix: str, spec: P | None = None) -> jax.Array:
             items = []
             for i in range(config.num_hidden_layers):
                 key = f"{layer_prefix}layers.{i}.{suffix}"
                 if key not in raw:
                     raise KeyError(f"Missing block-drafter tensor {key!r}")
-                arr = raw[key]
-                if transpose:
-                    arr = np.ascontiguousarray(arr.T)
-                items.append(arr)
+                items.append(raw[key])
             return _place_np_sharded(
                 np.stack(items, axis=0), P() if spec is None else spec, mesh, dtype, np_dtype
             )
 
-        def stack_layer_optional(
-            suffix: str, transpose: bool = False, spec: P | None = None
-        ) -> jax.Array | None:
+        def stack_layer_optional(suffix: str, spec: P | None = None) -> jax.Array | None:
             if f"{layer_prefix}layers.0.{suffix}" not in raw:
                 return None
-            return stack_layer(suffix, transpose=transpose, spec=spec)
+            return stack_layer(suffix, spec=spec)
+
+        def stack_linear(suffix: str, spec: P) -> tuple[jax.Array, jax.Array | None]:
+            if norm_quant == "none":
+                items = []
+                for i in range(config.num_hidden_layers):
+                    key = f"{layer_prefix}layers.{i}.{suffix}"
+                    if key not in raw:
+                        raise KeyError(f"Missing block-drafter tensor {key!r}")
+                    items.append(np.ascontiguousarray(raw[key].T))
+                return _place_np_sharded(np.stack(items, axis=0), spec, mesh, dtype, np_dtype), None
+
+            q_items = []
+            s_items = []
+            for i in range(config.num_hidden_layers):
+                key = f"{layer_prefix}layers.{i}.{suffix}"
+                if key not in raw:
+                    raise KeyError(f"Missing block-drafter tensor {key!r}")
+                q_i, s_i = quantize_np_per_channel(np.ascontiguousarray(raw[key].T), norm_quant)
+                q_items.append(q_i)
+                s_items.append(s_i)
+            return (
+                place_np_sharded_preserved(np.stack(q_items, axis=0), spec, mesh),
+                place_np_sharded_preserved(
+                    np.stack(s_items, axis=0), scale_spec_for_weight(spec), mesh
+                ),
+            )
+
+        fc, fc_scale = get_fc()
+        wq, wq_scale = stack_linear("self_attn.q_proj.weight", P(None, None, "tp"))
+        wk, wk_scale = stack_linear("self_attn.k_proj.weight", P(None, None, "tp"))
+        wv, wv_scale = stack_linear("self_attn.v_proj.weight", P(None, None, "tp"))
+        wo, wo_scale = stack_linear("self_attn.o_proj.weight", P(None, "tp", None))
+        w_gate, w_gate_scale = stack_linear("mlp.gate_proj.weight", P(None, None, "tp"))
+        w_up, w_up_scale = stack_linear("mlp.up_proj.weight", P(None, None, "tp"))
+        w_down, w_down_scale = stack_linear("mlp.down_proj.weight", P(None, "tp", None))
 
         return cls(
-            fc=get_top("fc.weight", transpose=True),
-            hidden_norm=get_top("hidden_norm.weight", transpose=False),
-            final_norm=get_top("norm.weight", transpose=False),
+            fc=fc,
+            hidden_norm=get_top_vec("hidden_norm.weight"),
+            final_norm=get_top_vec("norm.weight"),
             in_norm=stack_layer("input_layernorm.weight", spec=P()),
             post_norm=stack_layer("post_attention_layernorm.weight", spec=P()),
-            wq=stack_layer("self_attn.q_proj.weight", transpose=True, spec=P(None, None, "tp")),
+            wq=wq,
             bq=stack_layer_optional("self_attn.q_proj.bias", spec=P(None, "tp")),
-            wk=stack_layer("self_attn.k_proj.weight", transpose=True, spec=P(None, None, "tp")),
+            wk=wk,
             bk=stack_layer_optional("self_attn.k_proj.bias", spec=P(None, "tp")),
-            wv=stack_layer("self_attn.v_proj.weight", transpose=True, spec=P(None, None, "tp")),
+            wv=wv,
             bv=stack_layer_optional("self_attn.v_proj.bias", spec=P(None, "tp")),
-            wo=stack_layer("self_attn.o_proj.weight", transpose=True, spec=P(None, "tp", None)),
-            w_gate=stack_layer("mlp.gate_proj.weight", transpose=True, spec=P(None, None, "tp")),
-            w_up=stack_layer("mlp.up_proj.weight", transpose=True, spec=P(None, None, "tp")),
-            w_down=stack_layer("mlp.down_proj.weight", transpose=True, spec=P(None, "tp", None)),
+            wo=wo,
+            w_gate=w_gate,
+            w_up=w_up,
+            w_down=w_down,
             mesh=mesh,
             q_norm=stack_layer_optional("self_attn.q_norm.weight", spec=P()),
             k_norm=stack_layer_optional("self_attn.k_norm.weight", spec=P()),
+            weight_quant=norm_quant,
+            fc_scale=fc_scale,
+            wq_scale=wq_scale,
+            wk_scale=wk_scale,
+            wv_scale=wv_scale,
+            wo_scale=wo_scale,
+            w_gate_scale=w_gate_scale,
+            w_up_scale=w_up_scale,
+            w_down_scale=w_down_scale,
         )
 
     @classmethod
@@ -266,7 +368,9 @@ class BlockDiffusionWeights:
         config: BlockDiffusionConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
+        weight_quant: str = "none",
     ) -> BlockDiffusionWeights:
+        norm_quant = normalize_weight_quant(weight_quant)
         tensor_loc = _iter_safetensors_index(model_dir)
         np_dtype = _jnp_to_numpy_dtype(dtype)
         tp_size = mesh.size if mesh is not None else 1
@@ -279,32 +383,37 @@ class BlockDiffusionWeights:
         )
 
         with _MappedSafetensorsReader() as reader:
-            def read_top(name: str, transpose: bool = False) -> jax.Array:
+            def read_top_vec(name: str) -> jax.Array:
                 key = f"{top_prefix}{name}"
                 if key not in tensor_loc:
                     raise KeyError(f"Missing block-drafter tensor {key!r}")
                 arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
-                if transpose:
-                    arr = np.ascontiguousarray(arr.T)
                 return _place_np_sharded(arr, P(), mesh, dtype, np_dtype)
 
-            def stream_stacked_layer(suffix: str, transpose: bool, spec: P) -> jax.Array:
+            def read_fc() -> tuple[jax.Array, jax.Array | None]:
+                key = f"{top_prefix}fc.weight"
+                if key not in tensor_loc:
+                    raise KeyError(f"Missing block-drafter tensor {key!r}")
+                raw_fc = _read_indexed_tensor(
+                    tensor_loc[key], None if norm_quant != "none" else np_dtype, reader=reader
+                )
+                return quantize_and_place_2d(
+                    np.ascontiguousarray(raw_fc.T), P(), mesh, norm_quant, active_np_dtype=np_dtype
+                )
+
+            def stream_stacked_vec(suffix: str, spec: P) -> jax.Array:
                 num_layers = config.num_hidden_layers
                 key0 = f"{layer_prefix}layers.0.{suffix}"
                 if key0 not in tensor_loc:
                     raise KeyError(f"Missing block-drafter tensor {key0!r}")
-                raw_shape0 = tensor_loc[key0][2]
-                layer_shape = tuple(reversed(raw_shape0)) if transpose else raw_shape0
+                layer_shape = tensor_loc[key0][2]
                 full_shape = (num_layers,) + layer_shape
 
                 if mesh is None:
                     stacked = np.empty(full_shape, dtype=np_dtype)
                     for i in range(num_layers):
                         key = f"{layer_prefix}layers.{i}.{suffix}"
-                        arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
-                        if transpose:
-                            arr = np.ascontiguousarray(arr.T)
-                        stacked[i] = arr
+                        stacked[i] = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
                     out = jax.device_put(jnp.asarray(stacked, dtype=dtype))
                     del stacked
                     return out
@@ -313,12 +422,7 @@ class BlockDiffusionWeights:
                 local_devs = set(mesh.local_devices)
                 all_devs = list(mesh.devices.flat)
                 sample = _split_tensor_shard(
-                    np.empty(full_shape, dtype=np_dtype)
-                    if tp_size == 1
-                    else np.empty((1,) + layer_shape, dtype=np_dtype),
-                    spec,
-                    0,
-                    tp_size,
+                    np.empty((1,) + layer_shape, dtype=np_dtype), spec, 0, tp_size
                 )
                 shard_layer_shape = sample.shape[1:]
                 del sample
@@ -329,43 +433,169 @@ class BlockDiffusionWeights:
                         continue
                     rank = all_devs.index(dev)
                     rank_buf = np.empty((num_layers,) + shard_layer_shape, dtype=np_dtype)
+                    layer_spec = P(*spec[1:])
                     for i in range(num_layers):
                         key = f"{layer_prefix}layers.{i}.{suffix}"
                         arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
-                        if transpose:
-                            arr = np.ascontiguousarray(arr.T)
-                        rank_buf[i] = _split_tensor_shard(arr, P(*spec[1:]), rank, tp_size)
+                        rank_buf[i] = _split_tensor_shard(arr, layer_spec, rank, tp_size)
                         del arr
-                    device_arrays.append(jax.device_put(jnp.asarray(rank_buf, dtype=np_dtype), dev))
+                    device_arrays.append(jax.device_put(jnp.asarray(rank_buf), dev))
                     del rank_buf
                 return jax.make_array_from_single_device_arrays(full_shape, sharding, device_arrays)
 
-            def stream_stacked_layer_optional(
-                suffix: str, transpose: bool, spec: P
-            ) -> jax.Array | None:
+            def stream_stacked_vec_optional(suffix: str, spec: P) -> jax.Array | None:
                 if f"{layer_prefix}layers.0.{suffix}" not in tensor_loc:
                     return None
-                return stream_stacked_layer(suffix, transpose, spec)
+                return stream_stacked_vec(suffix, spec)
+
+            def stream_stacked_linear(
+                suffix: str,
+                spec: P,
+            ) -> tuple[jax.Array, jax.Array | None]:
+                num_layers = config.num_hidden_layers
+                key0 = f"{layer_prefix}layers.0.{suffix}"
+                if key0 not in tensor_loc:
+                    raise KeyError(f"Missing block-drafter tensor {key0!r}")
+                layer_shape = tuple(reversed(tensor_loc[key0][2]))
+                full_shape = (num_layers,) + layer_shape
+
+                if norm_quant == "none":
+                    if mesh is None:
+                        stacked = np.empty(full_shape, dtype=np_dtype)
+                        for i in range(num_layers):
+                            key = f"{layer_prefix}layers.{i}.{suffix}"
+                            arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
+                            stacked[i] = np.ascontiguousarray(arr.T)
+                            del arr
+                        out = jax.device_put(jnp.asarray(stacked, dtype=dtype))
+                        del stacked
+                        return out, None
+
+                    sharding = NamedSharding(mesh, spec)
+                    local_devs = set(mesh.local_devices)
+                    all_devs = list(mesh.devices.flat)
+                    sample = _split_tensor_shard(
+                        np.empty((1,) + layer_shape, dtype=np_dtype), spec, 0, tp_size
+                    )
+                    shard_layer_shape = sample.shape[1:]
+                    del sample
+                    layer_spec = P(*spec[1:])
+
+                    device_arrays = []
+                    for dev in all_devs:
+                        if dev not in local_devs:
+                            continue
+                        rank = all_devs.index(dev)
+                        rank_buf = np.empty((num_layers,) + shard_layer_shape, dtype=np_dtype)
+                        for i in range(num_layers):
+                            key = f"{layer_prefix}layers.{i}.{suffix}"
+                            arr = _read_indexed_tensor(tensor_loc[key], np_dtype, reader=reader)
+                            rank_buf[i] = _split_tensor_shard(
+                                np.ascontiguousarray(arr.T), layer_spec, rank, tp_size
+                            )
+                            del arr
+                        device_arrays.append(jax.device_put(jnp.asarray(rank_buf), dev))
+                        del rank_buf
+                    return jax.make_array_from_single_device_arrays(
+                        full_shape, sharding, device_arrays
+                    ), None
+
+                q_dtype = quant_np_dtype(norm_quant)
+                scale_spec = scale_spec_for_weight(spec)
+                full_scale_shape = (num_layers, layer_shape[-1])
+
+                if mesh is None:
+                    q_stacked = np.empty(full_shape, dtype=q_dtype)
+                    s_stacked = np.empty(full_scale_shape, dtype=np.float32)
+                    for i in range(num_layers):
+                        key = f"{layer_prefix}layers.{i}.{suffix}"
+                        raw_w = _read_indexed_tensor(tensor_loc[key], None, reader=reader)
+                        q_i, s_i = quantize_np_per_channel(np.ascontiguousarray(raw_w.T), norm_quant)
+                        del raw_w
+                        q_stacked[i] = q_i
+                        s_stacked[i] = s_i
+                    q_dev = jax.device_put(jnp.asarray(q_stacked))
+                    s_dev = jax.device_put(jnp.asarray(s_stacked))
+                    del q_stacked, s_stacked
+                    return q_dev, s_dev
+
+                w_sharding = NamedSharding(mesh, spec)
+                s_sharding = NamedSharding(mesh, scale_spec)
+                local_devs = set(mesh.local_devices)
+                all_devs = list(mesh.devices.flat)
+                layer_spec = P(*spec[1:])
+                layer_scale_spec = scale_spec_for_weight(layer_spec)
+                sample_w = _split_tensor_shard(
+                    np.empty((1,) + layer_shape, dtype=q_dtype), spec, 0, tp_size
+                )
+                sample_s = _split_tensor_shard(
+                    np.empty((1, layer_shape[-1]), dtype=np.float32), scale_spec, 0, tp_size
+                )
+                shard_w_shape = sample_w.shape[1:]
+                shard_s_shape = sample_s.shape[1:]
+                del sample_w, sample_s
+
+                w_arrays = []
+                s_arrays = []
+                for dev in all_devs:
+                    if dev not in local_devs:
+                        continue
+                    rank = all_devs.index(dev)
+                    rank_w_buf = np.empty((num_layers,) + shard_w_shape, dtype=q_dtype)
+                    rank_s_buf = np.empty((num_layers,) + shard_s_shape, dtype=np.float32)
+                    for i in range(num_layers):
+                        key = f"{layer_prefix}layers.{i}.{suffix}"
+                        raw_w = _read_indexed_tensor(tensor_loc[key], None, reader=reader)
+                        q_i, s_i = quantize_np_per_channel(np.ascontiguousarray(raw_w.T), norm_quant)
+                        del raw_w
+                        rank_w_buf[i] = _split_tensor_shard(q_i, layer_spec, rank, tp_size)
+                        rank_s_buf[i] = _split_tensor_shard(s_i, layer_scale_spec, rank, tp_size)
+                        del q_i, s_i
+                    w_arrays.append(jax.device_put(jnp.asarray(rank_w_buf), dev))
+                    s_arrays.append(jax.device_put(jnp.asarray(rank_s_buf), dev))
+                    del rank_w_buf, rank_s_buf
+                return (
+                    jax.make_array_from_single_device_arrays(full_shape, w_sharding, w_arrays),
+                    jax.make_array_from_single_device_arrays(full_scale_shape, s_sharding, s_arrays),
+                )
+
+            fc, fc_scale = read_fc()
+            wq, wq_scale = stream_stacked_linear("self_attn.q_proj.weight", P(None, None, "tp"))
+            wk, wk_scale = stream_stacked_linear("self_attn.k_proj.weight", P(None, None, "tp"))
+            wv, wv_scale = stream_stacked_linear("self_attn.v_proj.weight", P(None, None, "tp"))
+            wo, wo_scale = stream_stacked_linear("self_attn.o_proj.weight", P(None, "tp", None))
+            w_gate, w_gate_scale = stream_stacked_linear("mlp.gate_proj.weight", P(None, None, "tp"))
+            w_up, w_up_scale = stream_stacked_linear("mlp.up_proj.weight", P(None, None, "tp"))
+            w_down, w_down_scale = stream_stacked_linear("mlp.down_proj.weight", P(None, "tp", None))
 
             return cls(
-                fc=read_top("fc.weight", transpose=True),
-                hidden_norm=read_top("hidden_norm.weight", transpose=False),
-                final_norm=read_top("norm.weight", transpose=False),
-                in_norm=stream_stacked_layer("input_layernorm.weight", False, P()),
-                post_norm=stream_stacked_layer("post_attention_layernorm.weight", False, P()),
-                wq=stream_stacked_layer("self_attn.q_proj.weight", True, P(None, None, "tp")),
-                bq=stream_stacked_layer_optional("self_attn.q_proj.bias", False, P(None, "tp")),
-                wk=stream_stacked_layer("self_attn.k_proj.weight", True, P(None, None, "tp")),
-                bk=stream_stacked_layer_optional("self_attn.k_proj.bias", False, P(None, "tp")),
-                wv=stream_stacked_layer("self_attn.v_proj.weight", True, P(None, None, "tp")),
-                bv=stream_stacked_layer_optional("self_attn.v_proj.bias", False, P(None, "tp")),
-                wo=stream_stacked_layer("self_attn.o_proj.weight", True, P(None, "tp", None)),
-                w_gate=stream_stacked_layer("mlp.gate_proj.weight", True, P(None, None, "tp")),
-                w_up=stream_stacked_layer("mlp.up_proj.weight", True, P(None, None, "tp")),
-                w_down=stream_stacked_layer("mlp.down_proj.weight", True, P(None, "tp", None)),
+                fc=fc,
+                hidden_norm=read_top_vec("hidden_norm.weight"),
+                final_norm=read_top_vec("norm.weight"),
+                in_norm=stream_stacked_vec("input_layernorm.weight", P()),
+                post_norm=stream_stacked_vec("post_attention_layernorm.weight", P()),
+                wq=wq,
+                bq=stream_stacked_vec_optional("self_attn.q_proj.bias", P(None, "tp")),
+                wk=wk,
+                bk=stream_stacked_vec_optional("self_attn.k_proj.bias", P(None, "tp")),
+                wv=wv,
+                bv=stream_stacked_vec_optional("self_attn.v_proj.bias", P(None, "tp")),
+                wo=wo,
+                w_gate=w_gate,
+                w_up=w_up,
+                w_down=w_down,
                 mesh=mesh,
-                q_norm=stream_stacked_layer_optional("self_attn.q_norm.weight", False, P()),
-                k_norm=stream_stacked_layer_optional("self_attn.k_norm.weight", False, P()),
+                q_norm=stream_stacked_vec_optional("self_attn.q_norm.weight", P()),
+                k_norm=stream_stacked_vec_optional("self_attn.k_norm.weight", P()),
+                weight_quant=norm_quant,
+                fc_scale=fc_scale,
+                wq_scale=wq_scale,
+                wk_scale=wk_scale,
+                wv_scale=wv_scale,
+                wo_scale=wo_scale,
+                w_gate_scale=w_gate_scale,
+                w_up_scale=w_up_scale,
+                w_down_scale=w_down_scale,
             )
 
 
@@ -401,6 +631,7 @@ class QwenBlockTreeRunner:
         self.mesh = target_runner.mesh
         self.tp_size = target_runner.tp_size
         self.dtype = target_runner.dtype
+        self.weight_quant = draft_weights.weight_quant
 
         self.target_with_ctx_compile_count = 0
         self.commit_both_kv_compile_count = 0
@@ -413,27 +644,7 @@ class QwenBlockTreeRunner:
             dtype=np.int32,
         )
         self._capture_slots = target_runner._put_rep(capture_slots_np, dtype=jnp.int32)
-
-        dw = draft_weights
-        self._draft_weights_tuple: tuple[jax.Array | None, ...] = (
-            dw.fc,
-            dw.hidden_norm,
-            dw.final_norm,
-            dw.in_norm,
-            dw.post_norm,
-            dw.wq,
-            dw.bq,
-            dw.wk,
-            dw.bk,
-            dw.wv,
-            dw.bv,
-            dw.wo,
-            dw.w_gate,
-            dw.w_up,
-            dw.w_down,
-            dw.q_norm,
-            dw.k_norm,
-        )
+        self._draft_weights_tuple: DraftWeightsTuple = draft_weights.to_draft_weights_tuple()
 
         self._compile_block_tree_kernels()
 
@@ -471,7 +682,7 @@ class QwenBlockTreeRunner:
 
         @jax.jit
         def target_tile_with_ctx_jit(
-            target_wt: tuple[jax.Array | None, ...],
+            target_wt: TargetWeightsTuple,
             capture_slots: jax.Array,
             valid_prefix_len: jax.Array,
             token_tile: jax.Array,
@@ -481,8 +692,7 @@ class QwenBlockTreeRunner:
             v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             self.target_with_ctx_compile_count += 1
-            embed, final_norm, lm_head, *layer_weights = target_wt
-            x0 = embed[token_tile]
+            x0 = target_wt.embed[token_tile]
             if rep_sharding is not None:
                 x0 = jax.lax.with_sharding_constraint(x0, rep_sharding)
 
@@ -502,14 +712,12 @@ class QwenBlockTreeRunner:
 
             def body(
                 carry: tuple[jax.Array, jax.Array],
-                lw_and_slot: tuple[Any, ...],
+                scan_in: tuple[LayerScanWeights, jax.Array, jax.Array, jax.Array],
             ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
                 x, cap_buf = carry
                 if rep_sharding is not None:
                     x = jax.lax.with_sharding_constraint(x, rep_sharding)
-                lw = lw_and_slot[:-1]
-                slot = lw_and_slot[-1]
-                kc, vc = lw[-2], lw[-1]
+                lw, kc, vc, slot = scan_in
                 q, k_step, v_step = _qwen_qkv_proj(
                     x, lw, pos_tile, tcfg, head_sharding, kv_head_sharding
                 )
@@ -538,10 +746,12 @@ class QwenBlockTreeRunner:
             (x_final, cap_done), (step_k_out, step_v_out) = jax.lax.scan(
                 body,
                 (x0, cap_init),
-                (*layer_weights, k_cache, v_cache, capture_slots),
+                (target_wt.layers, k_cache, v_cache, capture_slots),
             )
-            normed = _rms_norm(x_final, final_norm, tcfg.rms_norm_eps)
-            logits_tile = _linear(normed, lm_head, out_dtype=jnp.float32)
+            normed = _rms_norm(x_final, target_wt.final_norm, tcfg.rms_norm_eps)
+            logits_tile = _linear(
+                normed, target_wt.lm_head, w_scale=target_wt.lm_head_scale, out_dtype=jnp.float32
+            )
             has_nan = jnp.any(jnp.isnan(logits_tile), axis=-1)
             argmax_tokens = jnp.where(
                 has_nan,
@@ -558,7 +768,7 @@ class QwenBlockTreeRunner:
 
         @jax.jit
         def commit_both_kv_jit(
-            draft_wt: tuple[jax.Array | None, ...],
+            draft_wt: DraftWeightsTuple,
             k_cache: jax.Array,
             v_cache: jax.Array,
             step_k: jax.Array,
@@ -571,7 +781,7 @@ class QwenBlockTreeRunner:
             n_valid: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             self.commit_both_kv_compile_count += 1
-            fc, hidden_norm, _, _, _, _, _, wk, bk, wv, bv, _, _, _, _, _, k_norm = draft_wt
+            dl = draft_wt.layers
 
             idx = jnp.arange(tile_size, dtype=jnp.int32)
             dest_positions = prev_prefix_len + idx
@@ -587,7 +797,11 @@ class QwenBlockTreeRunner:
 
             gathered_ctx = step_ctx_features[src_rows]
             # Project and normalize target hidden features once before feeding draft layer K/V.
-            target_h = _rms_norm(_linear(gathered_ctx, fc), hidden_norm, dcfg.rms_norm_eps)
+            target_h = _rms_norm(
+                _linear(gathered_ctx, draft_wt.fc, w_scale=draft_wt.fc_scale),
+                draft_wt.hidden_norm,
+                dcfg.rms_norm_eps,
+            )
             if rep_sharding is not None:
                 target_h = jax.lax.with_sharding_constraint(target_h, rep_sharding)
 
@@ -595,14 +809,14 @@ class QwenBlockTreeRunner:
                 _carry: None,
                 xs: tuple[jax.Array | None, ...],
             ) -> tuple[None, tuple[jax.Array, jax.Array]]:
-                wk_l, bk_l, wv_l, bv_l, kn_l, dkc, dvc = xs
-                k_ctx = _linear(target_h, wk_l, bk_l).reshape(
+                wk_l, wk_s, bk_l, wv_l, wv_s, bv_l, kn_l, dkc, dvc = xs
+                k_ctx = _linear(target_h, wk_l, bk_l, w_scale=wk_s).reshape(
                     tile_size, dcfg.num_key_value_heads, dcfg.head_dim
                 )
                 if kn_l is not None:
                     k_ctx = _rms_norm(k_ctx, kn_l, dcfg.rms_norm_eps)
                 k_ctx = _apply_qwen_rope(k_ctx, dest_positions, dcfg.head_dim, dcfg.rope_theta)
-                v_ctx = _linear(target_h, wv_l, bv_l).reshape(
+                v_ctx = _linear(target_h, wv_l, bv_l, w_scale=wv_s).reshape(
                     tile_size, dcfg.num_key_value_heads, dcfg.head_dim
                 )
                 if kv_head_sharding is not None:
@@ -615,7 +829,17 @@ class QwenBlockTreeRunner:
             _, (dk_next, dv_next) = jax.lax.scan(
                 draft_kv_body,
                 None,
-                (wk, bk, wv, bv, k_norm, draft_k_cache, draft_v_cache),
+                (
+                    dl.wk,
+                    dl.wk_scale,
+                    dl.bk,
+                    dl.wv,
+                    dl.wv_scale,
+                    dl.bv,
+                    dl.k_norm,
+                    draft_k_cache,
+                    draft_v_cache,
+                ),
             )
             if kv_cache_sharding is not None:
                 dk_next = jax.lax.with_sharding_constraint(dk_next, kv_cache_sharding)
@@ -626,14 +850,14 @@ class QwenBlockTreeRunner:
         def block_draft_top_k_jit(
             embed: jax.Array,
             lm_head: jax.Array,
-            draft_wt: tuple[jax.Array | None, ...],
+            lm_head_scale: jax.Array | None,
+            draft_wt: DraftWeightsTuple,
             root_token_id: jax.Array,
             cur_prefix: jax.Array,
             draft_k_cache: jax.Array,
             draft_v_cache: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
             self.draft_step_compile_count += 1
-            _, _, draft_final_norm, *draft_layer_weights = draft_wt
             mask_fill = jnp.full((block_size - 1,), mask_token_id, dtype=jnp.int32)
             block_ids = jnp.concatenate([root_token_id.reshape((1,)), mask_fill], axis=0)
             block_pos = cur_prefix + jnp.arange(block_size, dtype=jnp.int32)
@@ -654,11 +878,11 @@ class QwenBlockTreeRunner:
 
             def draft_body(
                 x: jax.Array,
-                lw: tuple[jax.Array | None, ...],
+                scan_in: tuple[LayerScanWeights, jax.Array, jax.Array],
             ) -> tuple[jax.Array, None]:
                 if rep_sharding is not None:
                     x = jax.lax.with_sharding_constraint(x, rep_sharding)
-                dkc, dvc = lw[-2], lw[-1]
+                lw, dkc, dvc = scan_in
                 q, k_noise, v_noise = _qwen_qkv_proj(
                     x, lw, block_pos, dcfg, head_sharding, kv_head_sharding
                 )
@@ -679,10 +903,10 @@ class QwenBlockTreeRunner:
             x_final, _ = jax.lax.scan(
                 draft_body,
                 x0,
-                (*draft_layer_weights, draft_k_cache, draft_v_cache),
+                (draft_wt.layers, draft_k_cache, draft_v_cache),
             )
-            normed = _rms_norm(x_final[1:], draft_final_norm, dcfg.rms_norm_eps)
-            logits = _linear(normed, lm_head, out_dtype=jnp.float32)
+            normed = _rms_norm(x_final[1:], draft_wt.final_norm, dcfg.rms_norm_eps)
+            logits = _linear(normed, lm_head, w_scale=lm_head_scale, out_dtype=jnp.float32)
             if rep_sharding is not None:
                 logits = jax.lax.with_sharding_constraint(logits, rep_sharding)
             top_logits, top_ids = jax.lax.top_k(logits, top_k)
@@ -738,8 +962,9 @@ class QwenBlockTreeRunner:
             self.target._put_rep(1, dtype=jnp.int32),
         )
         t_ids, t_probs = self._block_draft_top_k_jit(
-            self.target._weights_tuple[0],
-            self.target._weights_tuple[2],
+            self.target._weights_tuple.embed,
+            self.target._weights_tuple.lm_head,
+            self.target._weights_tuple.lm_head_scale,
             self._draft_weights_tuple,
             self.target._put_rep(0, dtype=jnp.int32),
             self.target._put_rep(1, dtype=jnp.int32),
@@ -784,8 +1009,9 @@ class QwenBlockTreeRunner:
         prefill_tiles = (max(0, len(prompt_tokens) - 1) + T - 1) // T
         target_wt = self.target._weights_tuple
         draft_wt = self._draft_weights_tuple
-        embed = target_wt[0]
-        lm_head = target_wt[2]
+        embed = target_wt.embed
+        lm_head = target_wt.lm_head
+        lm_head_scale = target_wt.lm_head_scale
 
         def _dispatch_target_tile(
             valid_prefix_len: int,
@@ -866,6 +1092,7 @@ class QwenBlockTreeRunner:
             top_ids_dev, top_probs_dev = self._block_draft_top_k_jit(
                 embed,
                 lm_head,
+                lm_head_scale,
                 draft_wt,
                 self.target._put_rep(root_tok, dtype=jnp.int32),
                 self.target._put_rep(valid_prefix_len, dtype=jnp.int32),
@@ -943,6 +1170,8 @@ class QwenBlockTreeRunner:
                 "draft_layers": self.draft_config.num_hidden_layers,
                 "tile_size": self.tile_size,
                 "tp_size": self.tp_size,
+                "weight_quant": self.target.weight_quant,
+                "draft_weight_quant": self.weight_quant,
             },
         )
 
@@ -956,6 +1185,8 @@ def load_qwen_block_tree_runner(
     tp_size: int | str = "auto",
     top_k: int = 8,
     enable_xla_cache: bool = True,
+    weight_quant: str = "none",
+    draft_weight_quant: str = "none",
 ) -> tuple[QwenBlockTreeRunner, Path, Path]:
     """Resolve and load target Qwen + block-diffusion draft checkpoints concurrently onto TPU HBM."""
     from tokenizers import Tokenizer
@@ -978,8 +1209,12 @@ def load_qwen_block_tree_runner(
 
     dtype = resolve_default_dtype(dtype_name)
     _, mesh = resolve_tp_mesh(tp_size, config=target_config)
-    target_weights = QwenWeights.from_model_dir(target_dir, target_config, dtype=dtype, mesh=mesh)
-    draft_weights = BlockDiffusionWeights.from_model_dir(draft_dir, draft_config, dtype=dtype, mesh=mesh)
+    target_weights = QwenWeights.from_model_dir(
+        target_dir, target_config, dtype=dtype, mesh=mesh, weight_quant=weight_quant
+    )
+    draft_weights = BlockDiffusionWeights.from_model_dir(
+        draft_dir, draft_config, dtype=dtype, mesh=mesh, weight_quant=draft_weight_quant
+    )
 
     base_runner = QwenBenchmarkRunner(
         config=target_config,

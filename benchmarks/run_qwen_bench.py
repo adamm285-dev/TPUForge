@@ -177,6 +177,7 @@ def run_benchmark_suite(
     preloaded: tuple[QwenBenchmarkRunner, Path] | None = None,
     draft_model_id: str | None = None,
     top_k: int = 8,
+    weight_quant: str = "none",
 ) -> dict[str, Any]:
     normalized_draft = draft_model_id.strip() if draft_model_id else ""
     block_runner: QwenBlockTreeRunner | None = None
@@ -215,6 +216,7 @@ def run_benchmark_suite(
             tile_size=tile_size,
             tp_size=tp_size,
             top_k=top_k,
+            weight_quant=weight_quant,
         )
         base_runner = block_runner.target
     else:
@@ -224,6 +226,7 @@ def run_benchmark_suite(
             dtype_name=dtype_name,
             tile_size=tile_size,
             tp_size=tp_size,
+            weight_quant=weight_quant,
         )
     load_s = time.perf_counter() - t_load0
 
@@ -248,6 +251,7 @@ def run_benchmark_suite(
     print(
         f"Backend: {backend} ({len(devices)}x {devices[0]}) | TP={base_runner.tp_size} | "
         f"Tile={base_runner.tile_size}x{base_runner.tile_size} | Dtype: {base_runner.dtype} | "
+        f"Quant: {base_runner.weight_quant} ({base_runner.model_hbm_bytes / (1024 * 1024):.1f} MiB) | "
         f"Layers: {cfg.num_hidden_layers} | Vocab: {cfg.vocab_size} | Load: {load_s:.2f}s"
     )
     if backend == "cpu":
@@ -374,6 +378,8 @@ def run_benchmark_suite(
         "tp_size": base_runner.tp_size,
         "tile_size": base_runner.tile_size,
         "dtype": str(base_runner.dtype),
+        "weight_quant": base_runner.weight_quant,
+        "model_hbm_bytes": base_runner.model_hbm_bytes,
         "max_seq_len": max_seq_len,
         "max_new_tokens": max_new_tokens,
         "load_seconds": round(load_s, 3),
@@ -468,6 +474,12 @@ def main() -> int:
         help="Megatron tensor-parallelism degree ('auto', or integer e.g. 1, 2, 4, 8).",
     )
     parser.add_argument(
+        "--weight-quant",
+        default="none",
+        choices=["none", "int8", "fp8"],
+        help="Weight-only systolic quantization mode ('none', 'int8', or 'fp8').",
+    )
+    parser.add_argument(
         "--output-json",
         default="benchmarks/results/latest_qwen_bench.json",
         help="Path to write JSON telemetry output.",
@@ -485,6 +497,7 @@ def main() -> int:
         tp_size=args.tp_size,
         draft_model_id=args.draft_model or None,
         top_k=args.top_k,
+        weight_quant=args.weight_quant,
     )
     return 0
 
