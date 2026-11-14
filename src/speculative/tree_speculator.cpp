@@ -130,81 +130,151 @@ void compute_softmax(const float* logits, size_t vocab_size, float temperature, 
     }
 }
 
-std::vector<TreeBuilder::BranchCandidate> query_suffix_candidates(
-    const std::vector<int32_t>& context_tokens,
-    const std::vector<int32_t>& path_after_root,
-    size_t top_k = 3
-) {
-    // Reconstruct active virtual suffix ending at the candidate node.
-    std::vector<int32_t> virtual_seq;
-    const size_t max_order = 4;
-    const size_t ctx_len = context_tokens.size();
-    const size_t ctx_tail_keep = std::min(ctx_len, max_order);
-    virtual_seq.reserve(ctx_tail_keep + path_after_root.size());
-    for (size_t i = ctx_len - ctx_tail_keep; i < ctx_len; ++i) {
-        virtual_seq.push_back(context_tokens[i]);
-    }
-    for (int32_t t : path_after_root) {
-        virtual_seq.push_back(t);
-    }
+struct NGramKey {
+    uint8_t order{0};
+    int32_t t[4]{0, 0, 0, 0};
 
-    std::unordered_map<int32_t, double> scores;
-    const size_t vlen = virtual_seq.size();
-    const size_t limit_order = std::min(max_order, vlen);
-
-    // Match n-grams of order 4 down to 1 against historical context_tokens.
-    for (size_t order = limit_order; order >= 1; --order) {
-        if (ctx_len <= order) {
-            continue;
+    bool operator==(const NGramKey& other) const noexcept {
+        if (order != other.order) {
+            return false;
         }
-        const size_t v_start = vlen - order;
-        double order_weight = std::pow(10.0, static_cast<double>(order));
-        for (size_t pos = order - 1; pos + 1 < ctx_len; ++pos) {
-            bool match = true;
-            for (size_t k = 0; k < order; ++k) {
-                if (context_tokens[pos - order + 1 + k] != virtual_seq[v_start + k]) {
-                    match = false;
-                    break;
+        for (uint8_t i = 0; i < order; ++i) {
+            if (t[i] != other.t[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+struct NGramKeyHash {
+    size_t operator()(const NGramKey& k) const noexcept {
+        uint64_t h = 0x9e3779b97f4a7c15ULL ^ static_cast<uint64_t>(k.order);
+        for (uint8_t i = 0; i < k.order; ++i) {
+            uint64_t x = static_cast<uint32_t>(k.t[i]);
+            h ^= x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+        h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+        return static_cast<size_t>(h ^ (h >> 31));
+    }
+};
+
+struct TransitionStats {
+    int32_t next_tok{0};
+    uint32_t count{0};
+    uint64_t pos_sum{0};
+};
+
+struct NGramBucket {
+    static constexpr size_t kLinearThreshold = 16;
+    static constexpr size_t kCacheTopThreshold = 128;
+    static constexpr size_t kTopScanCap = 64;
+
+    std::vector<TransitionStats> items;
+    std::unordered_map<int32_t, size_t> pos_by_tok;
+    mutable std::vector<size_t> cached_top;
+    mutable bool dirty{false};
+
+    void record(int32_t next_tok, uint64_t pos) {
+        if (items.size() <= kLinearThreshold && pos_by_tok.empty()) {
+            for (auto& e : items) {
+                if (e.next_tok == next_tok) {
+                    ++e.count;
+                    e.pos_sum += pos;
+                    dirty = true;
+                    return;
                 }
             }
-            if (match) {
-                int32_t next_tok = context_tokens[pos + 1];
-                double recency = 1.0 + static_cast<double>(pos) / static_cast<double>(ctx_len);
-                scores[next_tok] += order_weight * recency;
+            if (items.size() == kLinearThreshold) {
+                for (size_t i = 0; i < items.size(); ++i) {
+                    pos_by_tok.emplace(items[i].next_tok, i);
+                }
+            } else {
+                items.push_back(TransitionStats{next_tok, 1u, pos});
+                dirty = true;
+                return;
             }
         }
+        auto it = pos_by_tok.find(next_tok);
+        if (it != pos_by_tok.end()) {
+            auto& e = items[it->second];
+            ++e.count;
+            e.pos_sum += pos;
+        } else {
+            pos_by_tok.emplace(next_tok, items.size());
+            items.push_back(TransitionStats{next_tok, 1u, pos});
+        }
+        dirty = true;
     }
 
-    if (scores.empty()) {
+    template <typename Visitor>
+    void visit_top(Visitor&& fn) const {
+        if (items.size() <= kCacheTopThreshold) {
+            for (const auto& e : items) {
+                fn(e);
+            }
+            return;
+        }
+        if (dirty) {
+            cached_top.resize(items.size());
+            for (size_t i = 0; i < items.size(); ++i) {
+                cached_top[i] = i;
+            }
+            const size_t cap = std::min(kTopScanCap, cached_top.size());
+            std::partial_sort(
+                cached_top.begin(),
+                cached_top.begin() + static_cast<std::ptrdiff_t>(cap),
+                cached_top.end(),
+                [&](size_t a, size_t b) {
+                    const auto& ea = items[a];
+                    const auto& eb = items[b];
+                    if (ea.count != eb.count) {
+                        return ea.count > eb.count;
+                    }
+                    if (ea.pos_sum != eb.pos_sum) {
+                        return ea.pos_sum > eb.pos_sum;
+                    }
+                    return ea.next_tok < eb.next_tok;
+                }
+            );
+            cached_top.resize(cap);
+            dirty = false;
+        }
+        for (size_t idx : cached_top) {
+            fn(items[idx]);
+        }
+    }
+};
+
+size_t resolve_drafter_tile_size(size_t tile_size, size_t max_nodes, const char* caller) {
+    const size_t resolved = (tile_size == 0)
+        ? (max_nodes > SystolicTree::kMaxNodes
+               ? SystolicConstants::kSystolicTileSizeV6
+               : SystolicConstants::kSystolicTileSize)
+        : tile_size;
+    if (!SystolicConstants::is_valid_tile_size(resolved)) {
+        throw std::invalid_argument(std::string(caller) + " tile_size must be 128 or 256");
+    }
+    return resolved;
+}
+
+bool has_child_token(const SystolicTree& tree, int32_t parent_idx, int32_t token_id) {
+    const auto& children = tree.nodes()[static_cast<size_t>(parent_idx)].children;
+    for (int32_t c : children) {
+        if (tree.nodes()[static_cast<size_t>(c)].token_id == token_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<int32_t> extract_path_after_root(const SystolicTree& tree, int32_t node_idx) {
+    std::vector<int32_t> full_path = extract_node_path(tree, node_idx);
+    if (full_path.size() <= 1) {
         return {};
     }
-
-    std::vector<std::pair<int32_t, double>> ranked(scores.begin(), scores.end());
-    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second) {
-            return a.second > b.second;
-        }
-        return a.first < b.first;
-    });
-
-    if (ranked.size() > top_k) {
-        ranked.resize(top_k);
-    }
-
-    double total = 0.0;
-    for (const auto& kv : ranked) {
-        total += kv.second;
-    }
-
-    std::vector<TreeBuilder::BranchCandidate> out;
-    out.reserve(ranked.size());
-    for (const auto& kv : ranked) {
-        out.push_back(TreeBuilder::BranchCandidate{
-            kv.first,
-            static_cast<float>(kv.second / total)
-        });
-    }
-    return out;
+    return std::vector<int32_t>(full_path.begin() + 1, full_path.end());
 }
 
 } // namespace
@@ -315,69 +385,8 @@ SystolicTree SuffixTreeDrafter::build_tree(
     size_t max_depth,
     size_t tile_size
 ) {
-    if (context_tokens.empty()) {
-        throw std::invalid_argument("SuffixTreeDrafter requires non-empty context_tokens");
-    }
-    const size_t resolved_tile = (tile_size == 0)
-        ? (max_nodes > SystolicTree::kMaxNodes
-               ? SystolicConstants::kSystolicTileSizeV6
-               : SystolicConstants::kSystolicTileSize)
-        : tile_size;
-    if (!SystolicConstants::is_valid_tile_size(resolved_tile)) {
-        throw std::invalid_argument("SuffixTreeDrafter tile_size must be 128 or 256");
-    }
-    const size_t clamped_nodes = std::clamp<size_t>(max_nodes, 1, resolved_tile);
-
-    SystolicTree tree(context_tokens.back(), resolved_tile);
-    if (clamped_nodes == 1 || max_depth == 0) {
-        return tree;
-    }
-
-    struct FrontierItem {
-        float priority;
-        int32_t node_idx;
-        bool operator<(const FrontierItem& other) const {
-            if (priority != other.priority) {
-                return priority < other.priority;
-            }
-            return node_idx > other.node_idx;
-        }
-    };
-
-    std::priority_queue<FrontierItem> pq;
-    pq.push(FrontierItem{0.0f, 0});
-
-    while (!pq.empty() && tree.num_nodes() < clamped_nodes) {
-        FrontierItem item = pq.top();
-        pq.pop();
-
-        const TreeNode& node = tree.nodes()[static_cast<size_t>(item.node_idx)];
-        if (static_cast<size_t>(node.depth) >= max_depth) {
-            continue;
-        }
-
-        // Extract path tokens after root (depth >= 1).
-        std::vector<int32_t> full_path = extract_node_path(tree, item.node_idx);
-        std::vector<int32_t> path_after_root;
-        if (full_path.size() > 1) {
-            path_after_root.assign(full_path.begin() + 1, full_path.end());
-        }
-
-        auto candidates = query_suffix_candidates(context_tokens, path_after_root, 3);
-        for (const auto& cand : candidates) {
-            if (tree.num_nodes() >= clamped_nodes) {
-                break;
-            }
-            int32_t child_idx = tree.add_child(item.node_idx, cand.token_id, cand.prob);
-            if (child_idx < 0) {
-                break;
-            }
-            float child_logprob = tree.nodes()[static_cast<size_t>(child_idx)].cumulative_logprob;
-            pq.push(FrontierItem{child_logprob, child_idx});
-        }
-    }
-
-    return tree;
+    SuffixIndex index(context_tokens);
+    return index.build_tree(max_nodes, max_depth, tile_size);
 }
 
 SystolicTree TreeBuilder::build_from_branching_callback(
@@ -435,6 +444,381 @@ SystolicTree TreeBuilder::build_from_branching_callback(
             }
             float child_logprob = tree.nodes()[static_cast<size_t>(child_idx)].cumulative_logprob;
             pq.push(FrontierItem{child_logprob, child_idx});
+        }
+    }
+
+    return tree;
+}
+
+struct SuffixIndex::Impl {
+    std::vector<int32_t> context;
+    std::unordered_map<NGramKey, NGramBucket, NGramKeyHash> buckets;
+};
+
+SuffixIndex::SuffixIndex() : impl_(new Impl()) {}
+
+SuffixIndex::SuffixIndex(const std::vector<int32_t>& initial_tokens) : impl_(new Impl()) {
+    reset(initial_tokens);
+}
+
+SuffixIndex::~SuffixIndex() {
+    delete impl_;
+    impl_ = nullptr;
+}
+
+SuffixIndex::SuffixIndex(const SuffixIndex& other)
+    : impl_(other.impl_ ? new Impl(*other.impl_) : new Impl()) {}
+
+SuffixIndex& SuffixIndex::operator=(const SuffixIndex& other) {
+    if (this != &other) {
+        Impl* next = other.impl_ ? new Impl(*other.impl_) : new Impl();
+        delete impl_;
+        impl_ = next;
+    }
+    return *this;
+}
+
+SuffixIndex::SuffixIndex(SuffixIndex&& other) noexcept : impl_(other.impl_) {
+    other.impl_ = nullptr;
+}
+
+SuffixIndex& SuffixIndex::operator=(SuffixIndex&& other) noexcept {
+    if (this != &other) {
+        delete impl_;
+        impl_ = other.impl_;
+        other.impl_ = nullptr;
+    }
+    return *this;
+}
+
+void SuffixIndex::reset(const std::vector<int32_t>& initial_tokens) {
+    if (!impl_) {
+        impl_ = new Impl();
+    }
+    impl_->context.clear();
+    impl_->buckets.clear();
+    if (!initial_tokens.empty()) {
+        append_tokens(initial_tokens.data(), initial_tokens.size());
+    }
+}
+
+void SuffixIndex::append_token(int32_t token_id) {
+    if (!impl_) {
+        impl_ = new Impl();
+    }
+    const size_t old_len = impl_->context.size();
+    if (old_len >= 1) {
+        const size_t pos = old_len - 1;
+        const size_t max_order = std::min<size_t>(4, old_len);
+        NGramKey key;
+        for (size_t order = 1; order <= max_order; ++order) {
+            key.order = static_cast<uint8_t>(order);
+            const size_t start = pos + 1 - order;
+            for (size_t k = 0; k < order; ++k) {
+                key.t[k] = impl_->context[start + k];
+            }
+            impl_->buckets[key].record(token_id, static_cast<uint64_t>(pos));
+        }
+    }
+    impl_->context.push_back(token_id);
+}
+
+void SuffixIndex::append_tokens(const int32_t* tokens, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    if (!tokens) {
+        throw std::invalid_argument("SuffixIndex::append_tokens received null tokens pointer");
+    }
+    if (!impl_) {
+        impl_ = new Impl();
+    }
+    impl_->context.reserve(impl_->context.size() + count);
+    if (impl_->buckets.empty() && count > 256) {
+        impl_->buckets.reserve(count * 3);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        append_token(tokens[i]);
+    }
+}
+
+std::vector<TreeBuilder::BranchCandidate> SuffixIndex::query(
+    const std::vector<int32_t>& path_after_root,
+    size_t top_k
+) const {
+    if (!impl_ || impl_->context.size() < 2 || top_k == 0) {
+        return {};
+    }
+    const size_t ctx_len = impl_->context.size();
+    const size_t vlen = ctx_len + path_after_root.size();
+    const size_t limit_order = std::min<size_t>(4, vlen);
+
+    std::unordered_map<int32_t, double> scores;
+    for (size_t order = limit_order; order >= 1; --order) {
+        if (ctx_len <= order) {
+            continue;
+        }
+        NGramKey key;
+        key.order = static_cast<uint8_t>(order);
+        const size_t v_start = vlen - order;
+        for (size_t k = 0; k < order; ++k) {
+            const size_t v_idx = v_start + k;
+            key.t[k] = (v_idx < ctx_len)
+                ? impl_->context[v_idx]
+                : path_after_root[v_idx - ctx_len];
+        }
+        auto it = impl_->buckets.find(key);
+        if (it == impl_->buckets.end()) {
+            continue;
+        }
+        const double order_weight = std::pow(10.0, static_cast<double>(order));
+        const double inv_ctx_len = 1.0 / static_cast<double>(ctx_len);
+        it->second.visit_top([&](const TransitionStats& e) {
+            const double sum_recency =
+                static_cast<double>(e.count) + static_cast<double>(e.pos_sum) * inv_ctx_len;
+            scores[e.next_tok] += order_weight * sum_recency;
+        });
+    }
+
+    if (scores.empty()) {
+        return {};
+    }
+
+    std::vector<std::pair<int32_t, double>> ranked(scores.begin(), scores.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) {
+            return a.second > b.second;
+        }
+        return a.first < b.first;
+    });
+    if (ranked.size() > top_k) {
+        ranked.resize(top_k);
+    }
+
+    double total = 0.0;
+    for (const auto& kv : ranked) {
+        total += kv.second;
+    }
+
+    std::vector<TreeBuilder::BranchCandidate> out;
+    out.reserve(ranked.size());
+    for (const auto& kv : ranked) {
+        out.push_back(TreeBuilder::BranchCandidate{
+            kv.first,
+            static_cast<float>(kv.second / total)
+        });
+    }
+    return out;
+}
+
+SystolicTree SuffixIndex::build_tree(
+    size_t max_nodes,
+    size_t max_depth,
+    size_t tile_size
+) const {
+    if (!impl_ || impl_->context.empty()) {
+        throw std::invalid_argument("SuffixTreeDrafter requires non-empty context_tokens");
+    }
+    const size_t resolved_tile = resolve_drafter_tile_size(tile_size, max_nodes, "SuffixTreeDrafter");
+    const size_t clamped_nodes = std::clamp<size_t>(max_nodes, 1, resolved_tile);
+
+    SystolicTree tree(impl_->context.back(), resolved_tile);
+    if (clamped_nodes == 1 || max_depth == 0) {
+        return tree;
+    }
+
+    struct FrontierItem {
+        float priority;
+        int32_t node_idx;
+        bool operator<(const FrontierItem& other) const {
+            if (priority != other.priority) {
+                return priority < other.priority;
+            }
+            return node_idx > other.node_idx;
+        }
+    };
+
+    std::priority_queue<FrontierItem> pq;
+    pq.push(FrontierItem{0.0f, 0});
+
+    while (!pq.empty() && tree.num_nodes() < clamped_nodes) {
+        FrontierItem item = pq.top();
+        pq.pop();
+
+        const TreeNode& node = tree.nodes()[static_cast<size_t>(item.node_idx)];
+        if (static_cast<size_t>(node.depth) >= max_depth) {
+            continue;
+        }
+
+        std::vector<int32_t> path_after_root = extract_path_after_root(tree, item.node_idx);
+        auto candidates = query(path_after_root, 3);
+        for (const auto& cand : candidates) {
+            if (tree.num_nodes() >= clamped_nodes) {
+                break;
+            }
+            int32_t child_idx = tree.add_child(item.node_idx, cand.token_id, cand.prob);
+            if (child_idx < 0) {
+                break;
+            }
+            float child_logprob = tree.nodes()[static_cast<size_t>(child_idx)].cumulative_logprob;
+            pq.push(FrontierItem{child_logprob, child_idx});
+        }
+    }
+
+    return tree;
+}
+
+size_t SuffixIndex::size() const noexcept {
+    return impl_ ? impl_->context.size() : 0;
+}
+
+const std::vector<int32_t>& SuffixIndex::context_tokens() const noexcept {
+    static const std::vector<int32_t> kEmpty;
+    return impl_ ? impl_->context : kEmpty;
+}
+
+SystolicTree TreeBuilder::build_from_block_top_k(
+    int32_t root_last_token,
+    const int32_t* draft_token_ids,
+    const float* draft_probs,
+    size_t block_steps,
+    size_t top_k,
+    const SuffixIndex* suffix_fallback,
+    size_t max_nodes,
+    size_t max_depth,
+    size_t tile_size
+) {
+    if (block_steps > 0 && top_k > 0 && (!draft_token_ids || !draft_probs)) {
+        throw std::invalid_argument(
+            "TreeBuilder::build_from_block_top_k requires non-null draft buffers"
+        );
+    }
+
+    const size_t resolved_tile = resolve_drafter_tile_size(
+        tile_size, max_nodes, "TreeBuilder::build_from_block_top_k"
+    );
+    const size_t clamped_nodes = std::clamp<size_t>(max_nodes, 1, resolved_tile);
+
+    SystolicTree tree(root_last_token, resolved_tile);
+    if (clamped_nodes == 1 || max_depth == 0) {
+        return tree;
+    }
+
+    // Reserve the full top-1 parallel block spine before spending slots on branches.
+    std::vector<int32_t> spine_nodes;
+    spine_nodes.reserve(std::min(block_steps, max_depth) + 1);
+    spine_nodes.push_back(0);
+    if (block_steps > 0 && top_k > 0) {
+        const size_t spine_steps = std::min(block_steps, max_depth);
+        for (size_t s = 0; s < spine_steps && tree.num_nodes() < clamped_nodes; ++s) {
+            const int32_t tok = draft_token_ids[s * top_k];
+            const float raw_p = draft_probs[s * top_k];
+            if (tok < 0 || !std::isfinite(raw_p) || raw_p <= 0.0f) {
+                break;
+            }
+            const float p = std::clamp(raw_p, 1e-6f, 1.0f);
+            const int32_t child_idx = tree.add_child(spine_nodes.back(), tok, p);
+            if (child_idx < 0) {
+                break;
+            }
+            spine_nodes.push_back(child_idx);
+        }
+    }
+
+    struct EdgeItem {
+        float score_logprob{0.0f};
+        int32_t parent_idx{0};
+        int32_t token_id{0};
+        float prob{0.0f};
+        bool operator<(const EdgeItem& other) const noexcept {
+            if (score_logprob != other.score_logprob) {
+                return score_logprob < other.score_logprob;
+            }
+            if (parent_idx != other.parent_idx) {
+                return parent_idx > other.parent_idx;
+            }
+            return token_id > other.token_id;
+        }
+    };
+
+    std::priority_queue<EdgeItem> pq;
+
+    auto push_dflash_edges = [&](int32_t parent_idx, size_t start_k) {
+        const size_t depth = static_cast<size_t>(tree.nodes()[static_cast<size_t>(parent_idx)].depth);
+        if (depth >= block_steps || depth >= max_depth || top_k == 0) {
+            return;
+        }
+        const float parent_lp = tree.nodes()[static_cast<size_t>(parent_idx)].cumulative_logprob;
+        for (size_t k = start_k; k < top_k; ++k) {
+            const int32_t tok = draft_token_ids[depth * top_k + k];
+            const float raw_p = draft_probs[depth * top_k + k];
+            if (tok < 0 || !std::isfinite(raw_p) || raw_p <= 0.0f) {
+                continue;
+            }
+            const float p = std::clamp(raw_p, 1e-6f, 1.0f);
+            pq.push(EdgeItem{parent_lp + std::log(p), parent_idx, tok, p});
+        }
+    };
+
+    auto push_suffix_edges = [&](int32_t parent_idx, float discount) {
+        if (!suffix_fallback || suffix_fallback->size() < 2) {
+            return;
+        }
+        const size_t depth = static_cast<size_t>(tree.nodes()[static_cast<size_t>(parent_idx)].depth);
+        if (depth >= max_depth) {
+            return;
+        }
+        std::vector<int32_t> path_after_root = extract_path_after_root(tree, parent_idx);
+        auto cands = suffix_fallback->query(path_after_root, 3);
+        const float parent_lp = tree.nodes()[static_cast<size_t>(parent_idx)].cumulative_logprob;
+        for (const auto& cand : cands) {
+            if (cand.token_id < 0 || !std::isfinite(cand.prob) || cand.prob <= 0.0f) {
+                continue;
+            }
+            const float p = std::clamp(cand.prob * discount, 1e-6f, 1.0f);
+            pq.push(EdgeItem{parent_lp + std::log(p), parent_idx, cand.token_id, p});
+        }
+    };
+
+    for (int32_t spine_idx : spine_nodes) {
+        const size_t d = static_cast<size_t>(tree.nodes()[static_cast<size_t>(spine_idx)].depth);
+        if (d >= max_depth) {
+            continue;
+        }
+        if (d < block_steps && top_k > 1) {
+            push_dflash_edges(spine_idx, 1);
+        }
+        if (suffix_fallback != nullptr) {
+            const float discount = (d >= block_steps) ? 0.5f : 0.05f;
+            push_suffix_edges(spine_idx, discount);
+        }
+    }
+
+    while (!pq.empty() && tree.num_nodes() < clamped_nodes) {
+        EdgeItem item = pq.top();
+        pq.pop();
+
+        const TreeNode& parent = tree.nodes()[static_cast<size_t>(item.parent_idx)];
+        if (static_cast<size_t>(parent.depth) >= max_depth) {
+            continue;
+        }
+        if (has_child_token(tree, item.parent_idx, item.token_id)) {
+            continue;
+        }
+
+        const int32_t child_idx = tree.add_child(item.parent_idx, item.token_id, item.prob);
+        if (child_idx < 0) {
+            break;
+        }
+
+        const size_t child_depth = static_cast<size_t>(tree.nodes()[static_cast<size_t>(child_idx)].depth);
+        if (child_depth >= max_depth) {
+            continue;
+        }
+        if (child_depth < block_steps && top_k > 0) {
+            push_dflash_edges(child_idx, 0);
+        } else if (suffix_fallback != nullptr) {
+            push_suffix_edges(child_idx, 0.5f);
         }
     }
 

@@ -59,6 +59,8 @@ private:
     std::vector<TreeNode> nodes_;
 };
 
+class SuffixIndex;
+
 class SuffixTreeDrafter {
 public:
     // Builds an up-to-tile_size speculative tree from n-gram suffix matches in context_tokens.
@@ -87,6 +89,56 @@ public:
         size_t max_depth = 16,
         size_t tile_size = 0
     );
+
+    // Packs a parallel block-diffusion top-K prediction table [block_steps, top_k] into an
+    // up-to-tile_size systolic verification tree, preserving the primary top-1 chain and using
+    // best-first cumulative log-probability plus optional SuffixIndex fallback to fill remaining slots.
+    static SystolicTree build_from_block_top_k(
+        int32_t root_last_token,
+        const int32_t* draft_token_ids,
+        const float* draft_probs,
+        size_t block_steps,
+        size_t top_k,
+        const SuffixIndex* suffix_fallback = nullptr,
+        size_t max_nodes = SystolicTree::kMaxNodes,
+        size_t max_depth = 16,
+        size_t tile_size = 0
+    );
+};
+
+// Incremental O(1)-update, O(1)-query n-gram (order 1..4) hash index over historical context tokens.
+class SuffixIndex {
+public:
+    SuffixIndex();
+    explicit SuffixIndex(const std::vector<int32_t>& initial_tokens);
+    ~SuffixIndex();
+
+    SuffixIndex(const SuffixIndex& other);
+    SuffixIndex& operator=(const SuffixIndex& other);
+    SuffixIndex(SuffixIndex&& other) noexcept;
+    SuffixIndex& operator=(SuffixIndex&& other) noexcept;
+
+    void reset(const std::vector<int32_t>& initial_tokens);
+    void append_token(int32_t token_id);
+    void append_tokens(const int32_t* tokens, size_t count);
+
+    std::vector<TreeBuilder::BranchCandidate> query(
+        const std::vector<int32_t>& path_after_root,
+        size_t top_k = 3
+    ) const;
+
+    SystolicTree build_tree(
+        size_t max_nodes = SystolicTree::kMaxNodes,
+        size_t max_depth = 16,
+        size_t tile_size = 0
+    ) const;
+
+    size_t size() const noexcept;
+    const std::vector<int32_t>& context_tokens() const noexcept;
+
+private:
+    struct Impl;
+    Impl* impl_{nullptr};
 };
 
 struct TreeVerificationResult {

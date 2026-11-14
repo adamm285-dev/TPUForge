@@ -123,6 +123,14 @@ public:
         const float* mask_TxT,
         int32_t* out_argmax_tokens
     )>;
+    using DraftTreeFn = std::function<SystolicTree(
+        int32_t valid_prefix_len,
+        const std::vector<int32_t>& history,
+        const SuffixIndex& suffix_index,
+        size_t max_nodes,
+        size_t max_depth,
+        size_t tile_size
+    )>;
     using StreamTokenCallback = std::function<bool(const std::string& utf8_delta, int32_t token_id)>;
 
     ForgeEngine(
@@ -139,7 +147,8 @@ public:
         CommitKvFn commit_kv_fn = nullptr,
         std::string model_id = "tpuforge-custom-128",
         PrefillStepFn prefill_step_fn = nullptr,
-        GreedyStepFn greedy_step_fn = nullptr
+        GreedyStepFn greedy_step_fn = nullptr,
+        DraftTreeFn draft_tree_fn = nullptr
     );
 
     ~ForgeEngine() = default;
@@ -175,6 +184,7 @@ private:
     CommitKvFn commit_kv_fn_;
     PrefillStepFn prefill_step_fn_;
     GreedyStepFn greedy_step_fn_;
+    DraftTreeFn draft_tree_fn_;
     std::vector<float> pjrt_step_k_;
     std::vector<float> pjrt_step_v_;
     mutable std::mutex engine_mu_;

@@ -61,9 +61,9 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
   - `ops/`: Systolic-aligned matrix operations and attention verification kernels.
   - `speculative/`: Speculative decoding coordination and exact-token verification.
   - `runtime/`: PJRT loader and HLO execution pipeline.
-- `benchmarks/`: Microbenchmarks for memory bandwidth, latency, and tokens/sec.
-- `scripts/`: TPU provisioning, research cloud submission materials, and Colab runners.
-- `colab/`: Ready-to-run Google Colab notebooks for testing on interactive TPU runtimes.
+- `benchmarks/`: Microbenchmarks and JAX/XLA runners (`qwen_jax.py`, `dflash_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
+- `tests/`: Unit, C++/nanobind, XLA sharding, DFlash, and ring-attention test suites (`pytest`).
+- `docs/`: Architecture and TRC grant proposal notes (`docs/TRC_APPLICATION.md`).
 
 ---
 
@@ -71,7 +71,7 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 | Hardware Target | Status | Focus Area |
 | :--- | :--- | :--- |
-| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, OpenXLA GSPMD TP parity, 32/32 pytest |
+| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, `O(1)` `SuffixIndex`, DFlash tree packing, OpenXLA GSPMD TP parity, `36/36` pytest |
 | **Kaggle Free TPU `v5e-8` (128 GB HBM)** | Ready | 8x16 GB pooled HBM, Megatron TP (`7B` auto, `32B` `TP=8`), streaming loader |
 | **Cloud TPU `v5e` / `v6e` (Trillium)** | Verified (v5e-1) / Ready (v6e) | Auto `128x128` (v5e) or `256x256` (v6e/v7) MXU via `infer_mxu_dim` |
 | **Cloud TPU `v7` / `8x` Series** | Supported | Native `256x256` systolic tile parameterization |
@@ -102,15 +102,23 @@ pytest -q
 
 ### Real-Weight Qwen2.5-Coder Benchmark, ICI Ring-Attention (`M-005`), & Kaggle `v5e-8` Bundle
 ```bash
-# Run Vanilla JAX vs StaticArena (M-002) vs TPUForge Tree (M-003)
+# Run Vanilla JAX vs StaticArena (M-002) vs TPUForge Tree (M-003) on Qwen2.5 or Qwen3
 python -m benchmarks.run_qwen_bench --model Qwen/Qwen2.5-Coder-0.5B-Instruct --tile-size auto --tp-size auto
+
+# Run Hybrid Block-Diffusion (DFlash) + O(1) Suffix Tree Speculative Verification on Qwen3
+python -m benchmarks.run_qwen_bench --model Qwen/Qwen3-4B --draft-model z-lab/Qwen3-4B-DFlash-b16 --tile-size auto --tp-size auto
 
 # Run M-005 Optical Torus Ring-Attention (ppermute prefill + stationary-KV systolic tree decode via IciRingPlanner)
 python -m benchmarks.ring_attention_jax --max-seq-len 8192 --valid-seq-len 6144 --ring-size auto --tp-size 1
 
-# Build standalone source zip for Kaggle / Colab TPU upload
+# Build standalone source zip for Kaggle / Colab TPU upload (includes persistent XLA cache + mmap reader)
 python -m benchmarks.package_kaggle_bundle
 ```
+
+### Key Runtime Optimizations
+- **O(1) Incremental `SuffixIndex`:** Replaces `O(128 * ctx_len)` per-step scans with an incremental 1-to-4-gram hash table in C++ (`SuffixIndex`) for sub-millisecond `32K+` context drafting.
+- **Hybrid Block-Diffusion (`DFlash`) + Suffix Tree Packing:** Packs parallel `DFlash` draft logits (`top-k` per block slot) with `SuffixIndex` continuations via `TreeBuilder::build_from_block_top_k` into `128`- or `256`-row systolic verification tiles (`ForgeEngine(..., draft_tree_fn=...)`).
+- **Cold-Start Elimination:** Configures persistent OpenXLA compilation caching (`TPUFORGE_XLA_CACHE_DIR` / `configure_xla_compilation_cache`), persistent `mmap` handles (`_MappedSafetensorsReader`), and concurrent target+draft hub downloads.
 
 ### Running Native CLI on TPU via PJRT
 Set the environment variable pointing to the TPU PJRT plugin:
@@ -121,4 +129,4 @@ Set the environment variable pointing to the TPU PJRT plugin:
 ---
 
 ## 6. License
-Apache 2.0 / MIT Dual License.
+Apache License, Version 2.0 (see [LICENSE](LICENSE)).

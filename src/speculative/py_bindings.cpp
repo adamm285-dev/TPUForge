@@ -254,6 +254,65 @@ NB_MODULE(_tpuforge_ext, m) {
             return d;
         }, nb::arg("valid_prefix_len") = 0);
 
+    nb::class_<tpuforge::SuffixIndex>(m, "SuffixIndex")
+        .def(nb::init<>())
+        .def(nb::init<const std::vector<int32_t>&>(), nb::arg("initial_tokens"))
+        .def("reset", &tpuforge::SuffixIndex::reset, nb::arg("initial_tokens"))
+        .def("append_token", &tpuforge::SuffixIndex::append_token, nb::arg("token_id"))
+        .def("append_tokens",
+            [](tpuforge::SuffixIndex& idx,
+               nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> tokens) {
+                idx.append_tokens(tokens.data(), tokens.shape(0));
+            },
+            nb::arg("tokens").noconvert())
+        .def("query", &tpuforge::SuffixIndex::query,
+             nb::arg("path_after_root"), nb::arg("top_k") = 3)
+        .def("build_tree", &tpuforge::SuffixIndex::build_tree,
+             nb::arg("max_nodes") = tpuforge::SystolicTree::kMaxNodes,
+             nb::arg("max_depth") = 16,
+             nb::arg("tile_size") = 0)
+        .def("size", &tpuforge::SuffixIndex::size);
+
+    nb::class_<tpuforge::TreeBuilder::BranchCandidate>(m, "BranchCandidate")
+        .def(nb::init<>())
+        .def_rw("token_id", &tpuforge::TreeBuilder::BranchCandidate::token_id)
+        .def_rw("prob", &tpuforge::TreeBuilder::BranchCandidate::prob);
+
+    nb::class_<tpuforge::TreeBuilder>(m, "TreeBuilder")
+        .def_static("build_from_block_top_k",
+            [](int32_t root_last_token,
+               nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> draft_token_ids,
+               nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> draft_probs,
+               const tpuforge::SuffixIndex* suffix_fallback,
+               size_t max_nodes,
+               size_t max_depth,
+               size_t tile_size) {
+                if (draft_token_ids.shape(0) != draft_probs.shape(0) ||
+                    draft_token_ids.shape(1) != draft_probs.shape(1)) {
+                    throw std::invalid_argument(
+                        "draft_token_ids and draft_probs must share shape [block_steps, top_k]"
+                    );
+                }
+                return tpuforge::TreeBuilder::build_from_block_top_k(
+                    root_last_token,
+                    draft_token_ids.data(),
+                    draft_probs.data(),
+                    draft_token_ids.shape(0),
+                    draft_token_ids.shape(1),
+                    suffix_fallback,
+                    max_nodes,
+                    max_depth,
+                    tile_size
+                );
+            },
+            nb::arg("root_last_token"),
+            nb::arg("draft_token_ids").noconvert(),
+            nb::arg("draft_probs").noconvert(),
+            nb::arg("suffix_fallback") = nullptr,
+            nb::arg("max_nodes") = tpuforge::SystolicTree::kMaxNodes,
+            nb::arg("max_depth") = 16,
+            nb::arg("tile_size") = 0);
+
     nb::class_<tpuforge::SuffixTreeDrafter>(m, "SuffixTreeDrafter")
         .def_static("build_tree", &tpuforge::SuffixTreeDrafter::build_tree,
                     nb::arg("context_tokens"),
@@ -505,7 +564,8 @@ NB_MODULE(_tpuforge_ext, m) {
                 nb::object commit_kv_obj,
                 std::string model_id,
                 nb::object prefill_step_obj,
-                nb::object greedy_step_obj) {
+                nb::object greedy_step_obj,
+                nb::object draft_tree_obj) {
                  auto py_deleter = [](nb::callable* p) noexcept {
                      if (!p) {
                          return;
@@ -529,6 +589,7 @@ NB_MODULE(_tpuforge_ext, m) {
                  auto kv_cb = wrap_opt_cb(commit_kv_obj);
                  auto prefill_cb = wrap_opt_cb(prefill_step_obj);
                  auto greedy_cb = wrap_opt_cb(greedy_step_obj);
+                 auto draft_cb = wrap_opt_cb(draft_tree_obj);
 
                  const size_t vocab_size = config.vocab_size;
                  const size_t T = config.tile_size;
@@ -656,13 +717,48 @@ NB_MODULE(_tpuforge_ext, m) {
                      };
                  }
 
+                 tpuforge::ForgeEngine::DraftTreeFn cpp_draft;
+                 if (draft_cb) {
+                     cpp_draft = [draft_cb](
+                         int32_t valid_prefix_len,
+                         const std::vector<int32_t>& history,
+                         const tpuforge::SuffixIndex& suffix_index,
+                         size_t max_nodes,
+                         size_t max_depth,
+                         size_t tile_size
+                     ) -> tpuforge::SystolicTree {
+                         if (!is_python_active()) {
+                             throw std::runtime_error("Python interpreter is finalizing");
+                         }
+                         nb::gil_scoped_acquire gil;
+                         try {
+                             auto history_arr = make_1d_numpy<int32_t>(
+                                 history.empty() ? nullptr : history.data(),
+                                 history.size()
+                             );
+                             nb::object ret = (*draft_cb)(
+                                 valid_prefix_len,
+                                 history_arr,
+                                 nb::cast(&suffix_index, nb::rv_policy::reference),
+                                 max_nodes,
+                                 max_depth,
+                                 tile_size
+                             );
+                             return nb::cast<tpuforge::SystolicTree>(ret);
+                         } catch (nb::python_error& e) {
+                             throw std::runtime_error(e.what());
+                         }
+                     };
+                 }
+
                  new (self) tpuforge::ForgeEngine(
                      config,
                      std::move(cpp_step),
                      std::move(cpp_kv),
                      std::move(model_id),
                      std::move(cpp_prefill),
-                     std::move(cpp_greedy)
+                     std::move(cpp_greedy),
+                     std::move(cpp_draft)
                  );
              },
              nb::arg("config"),
@@ -670,7 +766,8 @@ NB_MODULE(_tpuforge_ext, m) {
              nb::arg("commit_kv_fn") = nb::none(),
              nb::arg("model_id") = "",
              nb::arg("prefill_step_fn") = nb::none(),
-             nb::arg("greedy_step_fn") = nb::none())
+             nb::arg("greedy_step_fn") = nb::none(),
+             nb::arg("draft_tree_fn") = nb::none())
         .def("generate",
              [](tpuforge::ForgeEngine& eng, const tpuforge::GenerationRequest& req) {
                  tpuforge::GenerationRequest req_copy = req;

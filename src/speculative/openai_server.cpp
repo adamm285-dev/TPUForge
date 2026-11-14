@@ -1031,7 +1031,8 @@ ForgeEngine::ForgeEngine(
     CommitKvFn commit_kv_fn,
     std::string model_id,
     PrefillStepFn prefill_step_fn,
-    GreedyStepFn greedy_step_fn
+    GreedyStepFn greedy_step_fn,
+    DraftTreeFn draft_tree_fn
 )
     : config_(config),
       model_id_(std::move(model_id)),
@@ -1040,7 +1041,8 @@ ForgeEngine::ForgeEngine(
       target_step_fn_(std::move(target_step_fn)),
       commit_kv_fn_(std::move(commit_kv_fn)),
       prefill_step_fn_(std::move(prefill_step_fn)),
-      greedy_step_fn_(std::move(greedy_step_fn)) {
+      greedy_step_fn_(std::move(greedy_step_fn)),
+      draft_tree_fn_(std::move(draft_tree_fn)) {
     if (config_.vocab_size < ByteTokenizer::kMinVocabSize) {
         throw std::invalid_argument("ForgeEngine requires vocab_size >= 260");
     }
@@ -1214,6 +1216,8 @@ GenerationResult ForgeEngine::generate(
                req.eos_token_ids.end();
     };
 
+    SuffixIndex suffix_index(history);
+
     while (generated.size() < req.max_tokens &&
            static_cast<size_t>(arena_.valid_prefix_len()) < max_prefix) {
         const int32_t cur_prefix = arena_.valid_prefix_len();
@@ -1221,9 +1225,12 @@ GenerationResult ForgeEngine::generate(
         const size_t budget = std::min(req.max_tokens - generated.size(), remaining_prefix);
         const size_t max_depth = std::min<size_t>(16, remaining_prefix);
 
-        SystolicTree tree = SuffixTreeDrafter::build_tree(
-            history, T, std::max<size_t>(1, max_depth), T
-        );
+        SystolicTree tree = draft_tree_fn_
+            ? draft_tree_fn_(cur_prefix, history, suffix_index, T, std::max<size_t>(1, max_depth), T)
+            : suffix_index.build_tree(T, std::max<size_t>(1, max_depth), T);
+        if (tree.tile_size() != T || tree.num_nodes() == 0) {
+            throw std::runtime_error("draft_tree_fn returned empty or tile_size-mismatched tree");
+        }
         PackedSystolicTile packed = tree.pack(cur_prefix);
 
         std::memcpy(arena_.token_tile(), packed.token_ids.data(), T * sizeof(int32_t));
@@ -1274,6 +1281,7 @@ GenerationResult ForgeEngine::generate(
             }
             generated.push_back(tok);
             history.push_back(tok);
+            suffix_index.append_token(tok);
             commit_count += 1;
 
             std::string delta = utf8_decoder.push_token(tok, config_.vocab_size, true);

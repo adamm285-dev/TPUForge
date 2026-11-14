@@ -11,15 +11,24 @@ from typing import Any
 
 import jax
 
+from benchmarks.dflash_jax import (
+    DFlashConfig,
+    DFlashWeights,
+    QwenDFlashRunner,
+    load_qwen_dflash_runner,
+)
 from benchmarks.qwen_jax import (
     QwenBenchmarkRunner,
     RunMetrics,
     encode_chat_messages,
     load_qwen_runner,
+    resolve_model_dir,
 )
 
 
-def _make_sweep_prompts(tokenizer: Any) -> list[tuple[str, list[int]]]:
+def _make_sweep_prompts(
+    tokenizer: Any, enable_thinking: bool | None = None
+) -> list[tuple[str, list[int]]]:
     """Build 4 unaligned prompt lengths to expose dynamic-shape XLA recompilations."""
     raw_texts = [
         "Return only a one-line Python lambda that squares x.",
@@ -51,6 +60,7 @@ def _make_sweep_prompts(tokenizer: Any) -> list[tuple[str, list[int]]]:
                 {"role": "system", "content": "You are a concise expert systems programmer."},
                 {"role": "user", "content": text},
             ],
+            enable_thinking=enable_thinking,
         )
         while len(toks) in seen_lens:
             toks.append(toks[-1])
@@ -59,7 +69,9 @@ def _make_sweep_prompts(tokenizer: Any) -> list[tuple[str, list[int]]]:
     return prompts
 
 
-def _make_refactor_prompt(tokenizer: Any) -> list[int]:
+def _make_refactor_prompt(
+    tokenizer: Any, enable_thinking: bool | None = None
+) -> list[int]:
     """Code refactor prompt with high context overlap for SuffixTreeDrafter evaluation."""
     source_code = (
         "class StaticArena:\n"
@@ -90,10 +102,13 @@ def _make_refactor_prompt(tokenizer: Any) -> list[int]:
             {"role": "system", "content": "You are a concise Python refactoring assistant."},
             {"role": "user", "content": user_msg},
         ],
+        enable_thinking=enable_thinking,
     )
 
 
-def _make_cold_codegen_prompt(tokenizer: Any) -> list[int]:
+def _make_cold_codegen_prompt(
+    tokenizer: Any, enable_thinking: bool | None = None
+) -> list[int]:
     """Fresh code generation prompt with minimal prompt n-gram overlap."""
     return encode_chat_messages(
         tokenizer,
@@ -107,6 +122,27 @@ def _make_cold_codegen_prompt(tokenizer: Any) -> list[int]:
                 ),
             },
         ],
+        enable_thinking=enable_thinking,
+    )
+
+
+def _make_cold_chat_prompt(
+    tokenizer: Any, enable_thinking: bool | None = None
+) -> list[int]:
+    """Natural-language cold chat prompt for DFlash block-diffusion evaluation."""
+    return encode_chat_messages(
+        tokenizer,
+        [
+            {"role": "system", "content": "You are a concise computer architecture instructor."},
+            {
+                "role": "user",
+                "content": (
+                    "Explain in 4 clear bullet points why fixed-shape matrix tiles prevent "
+                    "XLA graph recompilation stalls on systolic array accelerators."
+                ),
+            },
+        ],
+        enable_thinking=enable_thinking,
     )
 
 
@@ -114,6 +150,20 @@ def _metrics_dict(m: RunMetrics) -> dict[str, Any]:
     d = asdict(m)
     d["text_preview"] = m.text[:240]
     return d
+
+
+def _count_prefix_matches(a: list[int], b: list[int]) -> tuple[int, int]:
+    min_len = min(len(a), len(b))
+    matches = sum(1 for x, y in zip(a[:min_len], b[:min_len]) if x == y)
+    return matches, min_len
+
+
+def _print_mode_row(m: RunMetrics) -> None:
+    print(
+        f"  {m.mode:<16} | gen={m.generated_len:3d} | fwd_passes={m.forward_passes:3d} | "
+        f"dec_passes={m.decode_passes:3d} | tok/pass={m.mean_tokens_per_decode_pass:4.2f} | "
+        f"dec_s={m.decode_s:6.2f}s | tok/s={m.decode_tok_per_s:6.2f} | compiles={m.compile_count}"
+    )
 
 
 def run_benchmark_suite(
@@ -125,7 +175,14 @@ def run_benchmark_suite(
     tile_size: int | str = "auto",
     tp_size: int | str = "auto",
     preloaded: tuple[QwenBenchmarkRunner, Path] | None = None,
+    draft_model_id: str | None = None,
+    top_k: int = 8,
 ) -> dict[str, Any]:
+    normalized_draft = draft_model_id.strip() if draft_model_id else ""
+    dflash_runner: QwenDFlashRunner | None = None
+    draft_dir: Path | None = None
+    dflash_warmup_s = 0.0
+
     t_load0 = time.perf_counter()
     if preloaded is not None:
         prev_runner, model_dir = preloaded
@@ -137,6 +194,29 @@ def run_benchmark_suite(
             tile_size=tile_size,
             mesh=prev_runner.mesh,
         )
+        if normalized_draft:
+            draft_dir = resolve_model_dir(normalized_draft)
+            dflash_cfg = DFlashConfig.from_dir(draft_dir, target_config=base_runner.config)
+            dflash_weights = DFlashWeights.from_model_dir(
+                draft_dir, dflash_cfg, dtype=base_runner.dtype, mesh=base_runner.mesh
+            )
+            dflash_runner = QwenDFlashRunner(
+                target_runner=base_runner,
+                dflash_config=dflash_cfg,
+                dflash_weights=dflash_weights,
+                top_k=top_k,
+            )
+    elif normalized_draft:
+        dflash_runner, model_dir, draft_dir = load_qwen_dflash_runner(
+            model_id_or_path=model_id,
+            draft_model_id_or_path=normalized_draft,
+            max_seq_len=max_seq_len,
+            dtype_name=dtype_name,
+            tile_size=tile_size,
+            tp_size=tp_size,
+            top_k=top_k,
+        )
+        base_runner = dflash_runner.target
     else:
         base_runner, model_dir = load_qwen_runner(
             model_id_or_path=model_id,
@@ -147,12 +227,24 @@ def run_benchmark_suite(
         )
     load_s = time.perf_counter() - t_load0
 
+    if dflash_runner is not None:
+        dflash_warmup_s = dflash_runner.warmup()
+
     backend = jax.default_backend()
     devices = [str(d) for d in jax.devices()]
     cfg = base_runner.config
+    tok_to_id = getattr(base_runner.tokenizer, "token_to_id", None)
+    enable_thinking: bool | None = (
+        False if (tok_to_id is not None and tok_to_id("</think>") is not None) else None
+    )
 
     print("=" * 78)
     print(f"TPUForge Real-Weight Benchmark | Model: {model_id}")
+    if normalized_draft:
+        print(
+            f"Draft Model: {normalized_draft} | block_size={dflash_runner.dflash_config.block_size} | "
+            f"top_k={top_k} | warmup={dflash_warmup_s:.2f}s"
+        )
     print(
         f"Backend: {backend} ({len(devices)}x {devices[0]}) | TP={base_runner.tp_size} | "
         f"Tile={base_runner.tile_size}x{base_runner.tile_size} | Dtype: {base_runner.dtype} | "
@@ -166,9 +258,8 @@ def run_benchmark_suite(
         )
     print("=" * 78)
 
-    # Reuse base_runner directly (zero prior compilations, avoids duplicate runner instantiation).
     sweep_runner = base_runner
-    sweep_prompts = _make_sweep_prompts(base_runner.tokenizer)
+    sweep_prompts = _make_sweep_prompts(base_runner.tokenizer, enable_thinking=enable_thinking)
     w1_vanilla: list[dict[str, Any]] = []
     w1_static: list[dict[str, Any]] = []
     for name, toks in sweep_prompts:
@@ -193,50 +284,86 @@ def run_benchmark_suite(
         f"  static_arena -> compiles: {w1_s_compiles} | total sweep time: {w1_s_total_s:.2f}s"
     )
 
-    # Use sweep_runner (already warmed up once for static_arena) for Workload 2 & 3 steady-state
-    refactor_prompt = _make_refactor_prompt(base_runner.tokenizer)
-    # Warm vanilla_jax prefill for refactor_prompt length? Keep raw run to show real shape trace,
-    # and decode_s isolates steady-state decode speed cleanly.
+    refactor_prompt = _make_refactor_prompt(base_runner.tokenizer, enable_thinking=enable_thinking)
     w2_vanilla = sweep_runner.run_vanilla_jax(refactor_prompt, max_new_tokens=max_new_tokens)
     w2_static = sweep_runner.run_static_arena(refactor_prompt, max_new_tokens=max_new_tokens)
     w2_tree = sweep_runner.run_tpuforge_tree(refactor_prompt, max_new_tokens=max_new_tokens)
-
-    exact_static_tree_parity = w2_static.token_ids == w2_tree.token_ids
-    min_len = min(len(w2_vanilla.token_ids), len(w2_tree.token_ids))
-    vanilla_match_tokens = sum(
-        1 for a, b in zip(w2_vanilla.token_ids[:min_len], w2_tree.token_ids[:min_len]) if a == b
+    w2_dflash = (
+        dflash_runner.run_dflash_tree(refactor_prompt, max_new_tokens=max_new_tokens)
+        if dflash_runner is not None
+        else None
     )
 
+    exact_static_tree_parity = w2_static.token_ids == w2_tree.token_ids
+    vanilla_match_tokens, min_len = _count_prefix_matches(w2_vanilla.token_ids, w2_tree.token_ids)
+
     print(f"\n[Workload 2: Code Refactor (prompt_len={len(refactor_prompt)}, max_new={max_new_tokens})]")
-    for m in (w2_vanilla, w2_static, w2_tree):
-        print(
-            f"  {m.mode:<14} | gen={m.generated_len:3d} | fwd_passes={m.forward_passes:3d} | "
-            f"dec_passes={m.decode_passes:3d} | tok/pass={m.mean_tokens_per_decode_pass:4.2f} | "
-            f"dec_s={m.decode_s:6.2f}s | tok/s={m.decode_tok_per_s:5.2f} | compiles={m.compile_count}"
-        )
+    w2_runs = (w2_vanilla, w2_static, w2_tree) + ((w2_dflash,) if w2_dflash is not None else ())
+    for m in w2_runs:
+        _print_mode_row(m)
     print(
         f"  Parity: static_arena == tpuforge_tree: {exact_static_tree_parity} | "
         f"vanilla == tpuforge_tree: {vanilla_match_tokens}/{min_len} tokens"
     )
-    print(f"  Sample output (tpuforge_tree):\n{w2_tree.text[:320]}")
+    if w2_dflash is not None:
+        w2_df_static_parity = w2_static.token_ids == w2_dflash.token_ids
+        df_v_match, df_v_len = _count_prefix_matches(w2_vanilla.token_ids, w2_dflash.token_ids)
+        print(
+            f"  DFlash Parity: static_arena == tpuforge_dflash: {w2_df_static_parity} | "
+            f"vanilla == tpuforge_dflash: {df_v_match}/{df_v_len} tokens"
+        )
+    print(f"  Sample output ({w2_runs[-1].mode}):\n{w2_runs[-1].text[:320]}")
 
-    # Workload 3: Cold Code Generation Floor
-    cold_prompt = _make_cold_codegen_prompt(base_runner.tokenizer)
+    cold_prompt = _make_cold_codegen_prompt(base_runner.tokenizer, enable_thinking=enable_thinking)
     w3_vanilla = sweep_runner.run_vanilla_jax(cold_prompt, max_new_tokens=max_new_tokens)
     w3_tree = sweep_runner.run_tpuforge_tree(cold_prompt, max_new_tokens=max_new_tokens)
-    w3_min = min(len(w3_vanilla.token_ids), len(w3_tree.token_ids))
-    w3_match = sum(
-        1 for a, b in zip(w3_vanilla.token_ids[:w3_min], w3_tree.token_ids[:w3_min]) if a == b
+    w3_dflash = (
+        dflash_runner.run_dflash_tree(cold_prompt, max_new_tokens=max_new_tokens)
+        if dflash_runner is not None
+        else None
     )
+    w3_match, w3_min = _count_prefix_matches(w3_vanilla.token_ids, w3_tree.token_ids)
 
     print(f"\n[Workload 3: Fresh Code Generation Floor (prompt_len={len(cold_prompt)}, max_new={max_new_tokens})]")
-    for m in (w3_vanilla, w3_tree):
-        print(
-            f"  {m.mode:<14} | gen={m.generated_len:3d} | fwd_passes={m.forward_passes:3d} | "
-            f"dec_passes={m.decode_passes:3d} | tok/pass={m.mean_tokens_per_decode_pass:4.2f} | "
-            f"dec_s={m.decode_s:6.2f}s | tok/s={m.decode_tok_per_s:5.2f} | compiles={m.compile_count}"
-        )
+    w3_runs = (w3_vanilla, w3_tree) + ((w3_dflash,) if w3_dflash is not None else ())
+    for m in w3_runs:
+        _print_mode_row(m)
     print(f"  Parity: vanilla == tpuforge_tree: {w3_match}/{w3_min} tokens")
+    if w3_dflash is not None:
+        w3_df_tree_parity = w3_tree.token_ids == w3_dflash.token_ids
+        w3_df_match, w3_df_len = _count_prefix_matches(w3_vanilla.token_ids, w3_dflash.token_ids)
+        print(
+            f"  DFlash Parity: tpuforge_tree == tpuforge_dflash: {w3_df_tree_parity} | "
+            f"vanilla == tpuforge_dflash: {w3_df_match}/{w3_df_len} tokens"
+        )
+
+    w2_report: dict[str, Any] = {
+        "static_tree_exact_parity": exact_static_tree_parity,
+        "vanilla_tree_matching_tokens": vanilla_match_tokens,
+        "vanilla_tree_compared_tokens": min_len,
+        "vanilla_jax": _metrics_dict(w2_vanilla),
+        "static_arena": _metrics_dict(w2_static),
+        "tpuforge_tree": _metrics_dict(w2_tree),
+    }
+    if w2_dflash is not None:
+        df_v_match, df_v_len = _count_prefix_matches(w2_vanilla.token_ids, w2_dflash.token_ids)
+        w2_report["static_dflash_exact_parity"] = w2_static.token_ids == w2_dflash.token_ids
+        w2_report["vanilla_dflash_matching_tokens"] = df_v_match
+        w2_report["vanilla_dflash_compared_tokens"] = df_v_len
+        w2_report["tpuforge_dflash"] = _metrics_dict(w2_dflash)
+
+    w3_report: dict[str, Any] = {
+        "vanilla_tree_matching_tokens": w3_match,
+        "vanilla_tree_compared_tokens": w3_min,
+        "vanilla_jax": _metrics_dict(w3_vanilla),
+        "tpuforge_tree": _metrics_dict(w3_tree),
+    }
+    if w3_dflash is not None:
+        w3_df_match, w3_df_len = _count_prefix_matches(w3_vanilla.token_ids, w3_dflash.token_ids)
+        w3_report["tree_dflash_exact_parity"] = w3_tree.token_ids == w3_dflash.token_ids
+        w3_report["vanilla_dflash_matching_tokens"] = w3_df_match
+        w3_report["vanilla_dflash_compared_tokens"] = w3_df_len
+        w3_report["tpuforge_dflash"] = _metrics_dict(w3_dflash)
 
     report: dict[str, Any] = {
         "model_id": model_id,
@@ -259,21 +386,38 @@ def run_benchmark_suite(
             "vanilla_runs": w1_vanilla,
             "static_arena_runs": w1_static,
         },
-        "workload_2_code_refactor": {
-            "static_tree_exact_parity": exact_static_tree_parity,
-            "vanilla_tree_matching_tokens": vanilla_match_tokens,
-            "vanilla_tree_compared_tokens": min_len,
-            "vanilla_jax": _metrics_dict(w2_vanilla),
-            "static_arena": _metrics_dict(w2_static),
-            "tpuforge_tree": _metrics_dict(w2_tree),
-        },
-        "workload_3_cold_codegen": {
-            "vanilla_tree_matching_tokens": w3_match,
-            "vanilla_tree_compared_tokens": w3_min,
-            "vanilla_jax": _metrics_dict(w3_vanilla),
-            "tpuforge_tree": _metrics_dict(w3_tree),
-        },
+        "workload_2_code_refactor": w2_report,
+        "workload_3_cold_codegen": w3_report,
     }
+
+    if dflash_runner is not None:
+        chat_prompt = _make_cold_chat_prompt(base_runner.tokenizer, enable_thinking=enable_thinking)
+        w4_vanilla = sweep_runner.run_vanilla_jax(chat_prompt, max_new_tokens=max_new_tokens)
+        w4_tree = sweep_runner.run_tpuforge_tree(chat_prompt, max_new_tokens=max_new_tokens)
+        w4_dflash = dflash_runner.run_dflash_tree(chat_prompt, max_new_tokens=max_new_tokens)
+        w4_match_tree, w4_len_tree = _count_prefix_matches(w4_vanilla.token_ids, w4_tree.token_ids)
+        w4_match_df, w4_len_df = _count_prefix_matches(w4_vanilla.token_ids, w4_dflash.token_ids)
+        print(f"\n[Workload 4: Cold Chat Explanation (prompt_len={len(chat_prompt)}, max_new={max_new_tokens})]")
+        for m in (w4_vanilla, w4_tree, w4_dflash):
+            _print_mode_row(m)
+        print(
+            f"  Parity: tpuforge_tree == tpuforge_dflash: {w4_tree.token_ids == w4_dflash.token_ids} | "
+            f"vanilla == tpuforge_dflash: {w4_match_df}/{w4_len_df} tokens"
+        )
+        report["draft_model_id"] = normalized_draft
+        report["draft_model_dir"] = str(draft_dir)
+        report["dflash_top_k"] = top_k
+        report["dflash_warmup_seconds"] = round(dflash_warmup_s, 3)
+        report["workload_4_cold_chat"] = {
+            "vanilla_tree_matching_tokens": w4_match_tree,
+            "vanilla_tree_compared_tokens": w4_len_tree,
+            "vanilla_dflash_matching_tokens": w4_match_df,
+            "vanilla_dflash_compared_tokens": w4_len_df,
+            "tree_dflash_exact_parity": w4_tree.token_ids == w4_dflash.token_ids,
+            "vanilla_jax": _metrics_dict(w4_vanilla),
+            "tpuforge_tree": _metrics_dict(w4_tree),
+            "tpuforge_dflash": _metrics_dict(w4_dflash),
+        }
 
     if output_json is not None:
         output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -285,12 +429,23 @@ def run_benchmark_suite(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run Vanilla JAX vs TPUForge benchmark on real Qwen2.5-Coder weights."
+        description="Run Vanilla JAX vs TPUForge (plus optional DFlash) benchmark on Qwen weights."
     )
     parser.add_argument(
         "--model",
         default="Qwen/Qwen2.5-Coder-0.5B-Instruct",
         help="Hugging Face repo ID or local model directory.",
+    )
+    parser.add_argument(
+        "--draft-model",
+        default="",
+        help="Optional Hugging Face repo ID or local directory for a DFlash block drafter.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=8,
+        help="Top-K branching width per DFlash step packed into systolic tree.",
     )
     parser.add_argument("--max-seq-len", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=64)
@@ -322,6 +477,8 @@ def main() -> int:
         output_json=out_path,
         tile_size=args.tile_size,
         tp_size=args.tp_size,
+        draft_model_id=args.draft_model or None,
+        top_k=args.top_k,
     )
     return 0
 
