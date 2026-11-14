@@ -14,42 +14,52 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 2. **Systolic-Aligned Speculative Verification:** Traditional speculative decoding (draft -> verify) on GPUs optimizes for memory bandwidth. On TPUs, speculative verification must align with the $128 \times 128$ Matrix Multiply Unit (MXU) systolic array to prevent idle execution cycles.
 3. **Inter-Chip Interconnect (ICI) Topology Exploitation:** TPUs are connected in ultra-low-latency 2D/3D torus topologies. TPU Forge designs tensor and pipeline sharding explicitly around ICI link bandwidth rather than generic all-reduce abstractions.
 4. **Zero-Copy HBM Buffer Pooling:** Pre-allocated, pinned High Bandwidth Memory (HBM) ring buffers for Key-Value (KV) cache pages to ensure zero memory fragmentation during continuous token generation.
+5. **Native Mixed-Precision Systolic Quantization:** Per-channel `INT8` (`int8`) and `FP8` (`float8_e4m3fn`) weights multiplied directly against `bfloat16` activations inside constant-free MXU `dot_general` kernels to halve HBM weight reads and fit `14B` models on a single `16 GiB` TPU chip.
+6. **Host-Memory Sparse MoE Expert Streaming:** Keeps attention, routers, and pinned KV caches resident in TPU HBM while streaming routed Mixture-of-Experts weights (`mmap` or pinned DRAM) into fixed-shape `E_stage` HBM staging buffers, amortizing every PCIe expert transfer across all `128` nodes of the systolic verification tree.
 
 ---
 
 ## 2. Architecture Overview
 
 ```
-                      +---------------------------------------+
-                      |       Client / OpenAI API Server      |
-                      +---------------------------------------+
-                                          |
-                                          v
-                      +---------------------------------------+
-                      |         TPUForge Native Engine         |
-                      | (Token Dispatch, Continuous Batching) |
-                      +---------------------------------------+
-                                          |
-                        +-----------------+-----------------+
-                        |                                   |
-                        v                                   v
-             [Speculative Decoder]                 [KV-Cache Manager]
-         (Aligned MXU Draft-Verify)               (Pinned Ring-Buffer)
-                        |                                   |
-                        +-----------------+-----------------+
-                                          |
-                                          v
-                      +---------------------------------------+
-                      |         PJRT C API Abstraction        |
-                      |  (pjrt_c_api.h / Hardware Driver ABI)  |
-                      +---------------------------------------+
-                                          |
-                 +------------------------+------------------------+
-                 |                                                 |
-                 v                                                 v
-      [Local PJRT CPU Plugin]                         [Cloud TPU PJRT Plugin]
-      (Development / Simulation)                    (libpjrt_tpu.so / Hardware)
+        +-----------------------------------------------------------------+
+        |   Client / OpenAI /v1/chat/completions (`seed_snippets` + SSE)  |
+        +-----------------------------------------------------------------+
+                                         |
+                                         v
+        +-----------------------------------------------------------------+
+        |                 TPUForge Native C++20 Engine                    |
+        |   `ForgeEngine` | `O(1)` `SuffixIndex` + Out-of-Band AST Pack   |
+        |       Hybrid Block-Diffusion `TreeBuilder` (128 / 256 tile)     |
+        +-----------------------------------------------------------------+
+                     |                   |                    |
+        +------------+                   |                    +------------+
+        v                                v                                 v
++-----------------------+   +-------------------------+   +------------------------+
+| 128/256-Row Systolic  |   | Zero-Recompile Static   |   | Host mmap/DRAM Sparse  |
+| Tree Verifier &       |   | HBM Arena & Optical     |   | MoE Expert Stager      |
+| INT8/FP8 MXU Kernels  |   | Torus ICI Ring-Attn     |   | (E_stage -> 128 nodes) |
++-----------------------+   +-------------------------+   +------------------------+
+        |                                |                                 |
+        +--------------------------------+---------------------------------+
+                                         |
+                                         v
+        +-----------------------------------------------------------------+
+        |          OpenXLA / PJRT C ABI (`pjrt_c_api.h` Driver)           |
+        +-----------------------------------------------------------------+
+                         |                               |
+                         v                               v
+             [Local PJRT CPU Plugin]         [Cloud TPU PJRT Plugin]
+           (Development / Simulation)      (`libpjrt_tpu.so` / Silicon)
 ```
+
+1. **Client & Serving Ingress:** The native HTTP/1.1 `/v1/chat/completions` server (`OpenAIServer`) accepts OpenAI-compatible payloads, SSE streaming, and optional out-of-band `"seed_snippets"` without injecting any tokens into the prompt or KV cache.
+2. **TPUForge Native C++20 Engine (`ForgeEngine`):** Combines the lockstep `O(1)` `SuffixIndex` (pre-warmed by out-of-band repository AST and syntax idioms via `benchmarks/ast_seed_jax.py`) and the priority-queue hybrid block-diffusion `TreeBuilder::build_from_block_top_k` to pack fixed `128`- or `256`-node causal verification tiles.
+3. **Hardware-Aligned Execution Lanes:**
+   - **Systolic Tree Verifier & `INT8`/`FP8` MXU Kernels:** Executes on-device `jnp.argmax` tree verification (`verify_greedy_tokens`) and mixed-precision `BF16 x INT8/FP8` `dot_general` projections with `100%` exact greedy target parity.
+   - **Zero-Recompile Static HBM Arena & ICI Ring-Attention:** Eliminates dynamic-shape XLA stalls across arbitrary prompt lengths and circulates KV blocks over 1D/2D ICI torus links via `jax.lax.ppermute`.
+   - **Host `mmap`/DRAM Sparse MoE Stager:** Keeps trunk weights and KV caches pinned in HBM while asynchronously staging active `E_stage` routed experts per step and amortizing host-to-device bandwidth across the full `128`-node tree.
+4. **OpenXLA / PJRT Backend:** Dispatches fixed-shape compiled graphs directly through `pjrt_c_api.h` (`libpjrt_cpu` locally or `libpjrt_tpu.so` on Cloud TPU v5e/v6e/v7).
 
 ---
 
@@ -59,10 +69,10 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 - `src/`: Core engine implementation:
   - `core/`: Tensor buffers, memory allocators, and hardware device abstraction.
   - `ops/`: Systolic-aligned matrix operations and attention verification kernels.
-  - `speculative/`: Speculative decoding coordination and exact-token verification.
+  - `speculative/`: Speculative decoding coordination, `SuffixIndex`, HTTP serving, and exact-token verification.
   - `runtime/`: PJRT loader and HLO execution pipeline.
-- `benchmarks/`: Microbenchmarks and JAX/XLA runners (`qwen_jax.py`, `block_diffusion_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
-- `tests/`: Unit, C++/nanobind, XLA sharding, hybrid block-tree, and ring-attention test suites (`pytest`).
+- `benchmarks/`: Microbenchmarks and JAX/XLA runners (`qwen_jax.py`, `quantization_jax.py`, `moe_streaming_jax.py`, `ast_seed_jax.py`, `block_diffusion_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
+- `tests/`: Unit, C++/nanobind, XLA sharding, hybrid block-tree, quantized systolic (`INT8`/`FP8`), sparse MoE streaming, out-of-band AST seeding, and ring-attention test suites (`pytest`).
 - `docs/`: Architecture and TRC grant proposal notes (`docs/TRC_APPLICATION.md`).
 
 ---
@@ -71,7 +81,7 @@ Modern LLM serving engines have become burdened by heavy framework abstractions:
 
 | Hardware Target | Status | Focus Area |
 | :--- | :--- | :--- |
-| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, `O(1)` `SuffixIndex`, hybrid block-tree packing, OpenXLA GSPMD TP parity, `36/36` pytest |
+| **Local CPU (PJRT CPU)** | Active | 128/256 tile simulation, `O(1)` `SuffixIndex` + AST seeding, hybrid block-tree packing, `INT8`/`FP8` systolic kernels, sparse MoE `mmap`/DRAM streaming, OpenXLA GSPMD TP parity, `48/48` pytest |
 | **Kaggle Free TPU `v5e-8` (128 GB HBM)** | Ready | 8x16 GB pooled HBM, Megatron TP (`7B` auto, `32B` `TP=8`), streaming loader |
 | **Cloud TPU `v5e` / `v6e` (Trillium)** | Verified (v5e-1) / Ready (v6e) | Auto `128x128` (v5e) or `256x256` (v6e/v7) MXU via `infer_mxu_dim` |
 | **Cloud TPU `v7` / `8x` Series** | Supported | Native `256x256` systolic tile parameterization |
@@ -108,6 +118,12 @@ python -m benchmarks.run_qwen_bench --model Qwen/Qwen2.5-Coder-0.5B-Instruct --t
 # Run Hybrid Block-Diffusion + O(1) Suffix Systolic Tree Speculative Verification (`tpuforge_block_tree`, compatible with Z Lab DFlash HF checkpoints)
 python -m benchmarks.run_qwen_bench --model Qwen/Qwen3-4B --draft-model z-lab/Qwen3-4B-DFlash-b16 --tile-size auto --tp-size auto
 
+# Run Native INT8 Per-Channel Systolic Quantization + Out-of-Band Repository AST Seeding (`M-007` + `M-009`)
+python -m benchmarks.run_qwen_bench --model Qwen/Qwen2.5-Coder-14B-Instruct --weight-quant int8 --ast-seed-path . --tile-size auto --tp-size auto
+
+# Run Host-DRAM / mmap Sparse MoE Expert Streaming + 128-Node Systolic Tree Amortization (`M-008`)
+python -m benchmarks.moe_streaming_jax --model allenai/OLMoE-1B-7B-0924-Instruct --host-store mmap --stage-experts 16 --weight-quant int8
+
 # Run M-005 Optical Torus Ring-Attention (ppermute prefill + stationary-KV systolic tree decode via IciRingPlanner)
 python -m benchmarks.ring_attention_jax --max-seq-len 8192 --valid-seq-len 6144 --ring-size auto --tp-size 1
 
@@ -117,7 +133,10 @@ python -m benchmarks.package_kaggle_bundle
 
 ### Key Runtime Optimizations
 - **O(1) Incremental `SuffixIndex`:** Replaces `O(128 * ctx_len)` per-step scans with an incremental 1-to-4-gram hash table in C++ (`SuffixIndex`) for sub-millisecond `32K+` context drafting.
+- **Out-of-Band Repository AST & Idiom Seeding (`M-009`):** `SuffixIndex::seed_sequences`, `ForgeEngine::seed_ast_text`, HTTP `"seed_snippets"`, and `benchmarks/ast_seed_jax.py` pre-warm cold codegen drafting with zero prompt or KV-cache token overhead and 100% exact greedy parity.
 - **Hybrid Block-Diffusion + O(1) Suffix Systolic Tree Drafting (`tpuforge_block_tree`):** Implemented in `block_diffusion_jax.py` (`QwenBlockTreeRunner`, `TreeBuilder::build_from_block_top_k`, `ForgeEngine(..., draft_tree_fn=...)`); packs parallel block-drafter `top-k` candidates with `SuffixIndex` continuations into `128`- or `256`-row systolic verification tiles, with support for compatible public Hugging Face block-diffusion (`dflash_config`) checkpoints.
+- **Native `INT8` / `FP8` Per-Channel Systolic Kernels (`M-007`):** `benchmarks/quantization_jax.py` executes mixed-precision `jax.lax.dot_general` (`bfloat16` activations x `int8` or `float8_e4m3fn` weights) inside constant-free static arenas to cut HBM weight footprint and bandwidth ~2x.
+- **Host-DRAM / `mmap` Sparse MoE Expert Streaming (`M-008`):** `benchmarks/moe_streaming_jax.py` keeps attention, routers, and static KV caches in HBM while streaming active MoE experts (`OLMoE`, `Qwen3-MoE`) into fixed-shape `E_stage` HBM buffers, amortizing each PCIe transfer across all `128` speculative tree nodes.
 - **Cold-Start Elimination:** Configures persistent OpenXLA compilation caching (`TPUFORGE_XLA_CACHE_DIR` / `configure_xla_compilation_cache`), persistent `mmap` handles (`_MappedSafetensorsReader`), and concurrent target+draft hub downloads.
 
 ### Running Native CLI on TPU via PJRT
