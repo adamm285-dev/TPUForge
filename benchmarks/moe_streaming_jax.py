@@ -379,6 +379,8 @@ class ExpertHostStore:
         weight_quant: str = "none",
         host_store_mode: str = "mmap",
         lru_cache_experts: int = 64,
+        layer_prefix: str = "model.",
+        experts_subpath: str = "mlp.experts",
     ) -> None:
         self.model_dir = Path(model_dir)
         self.config = config
@@ -394,17 +396,20 @@ class ExpertHostStore:
             else self.active_np_dtype
         )
 
+        self.layer_prefix = layer_prefix
+        self.experts_subpath = experts_subpath.strip(".")
         self._tensor_loc = _iter_safetensors_index(self.model_dir)
         self._layer_layout: dict[int, str] = {}
         self._moe_layers: tuple[int, ...] = tuple(
             i for i in range(config.num_hidden_layers) if config.is_moe_layer(i)
         )
         for i in self._moe_layers:
-            key_2d = f"model.layers.{i}.mlp.experts.0.gate_proj.weight"
-            key_3d = f"model.layers.{i}.mlp.experts.gate_up_proj"
+            base = f"{self.layer_prefix}layers.{i}.{self.experts_subpath}"
+            key_2d = f"{base}.0.gate_proj.weight"
+            key_3d = f"{base}.gate_up_proj"
             if key_2d in self._tensor_loc:
                 self._layer_layout[i] = "2d"
-            elif key_3d in self._tensor_loc and f"model.layers.{i}.mlp.experts.down_proj" in self._tensor_loc:
+            elif key_3d in self._tensor_loc and f"{base}.down_proj" in self._tensor_loc:
                 self._layer_layout[i] = "3d_stacked"
             else:
                 raise KeyError(
@@ -496,8 +501,9 @@ class ExpertHostStore:
         layout = self._layer_layout[layer_idx]
         read_dtype = np.float32 if self.weight_quant != "none" else self.active_np_dtype
         moe_inter = self.config.moe_intermediate_size
+        base = f"{self.layer_prefix}layers.{layer_idx}.{self.experts_subpath}"
         if layout == "2d":
-            p = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"
+            p = f"{base}.{expert_idx}"
             raw_g = _read_indexed_tensor(
                 self._tensor_loc[f"{p}.gate_proj.weight"], read_dtype, reader=reader
             )
@@ -508,7 +514,7 @@ class ExpertHostStore:
                 self._tensor_loc[f"{p}.down_proj.weight"], read_dtype, reader=reader
             )
         else:
-            p = f"model.layers.{layer_idx}.mlp.experts"
+            p = base
             gu = self._read_stacked_slice(reader, self._tensor_loc[f"{p}.gate_up_proj"], expert_idx)
             if gu.shape[0] != 2 * moe_inter:
                 raise ValueError(

@@ -91,14 +91,11 @@ def quant_np_dtype(mode: str) -> Any:
 def scale_spec_for_weight(weight_spec: P) -> P:
     """Derive PartitionSpec for per-output-channel scales from weight PartitionSpec [..., in, out]."""
     ndim = len(weight_spec)
-    if ndim == 0:
+    if ndim == 0 or all(ax is None for ax in weight_spec):
         return P()
-    if ndim == 2:
-        return P(weight_spec[1]) if weight_spec[1] is not None else P()
-    if ndim == 3:
-        if weight_spec[0] is not None or weight_spec[2] is not None:
-            return P(weight_spec[0], weight_spec[2])
-        return P()
+    if ndim >= 2:
+        scale_axes = tuple(weight_spec[:-2]) + (weight_spec[-1],)
+        return P(*scale_axes) if any(ax is not None for ax in scale_axes) else P()
     raise ValueError(f"Unsupported weight PartitionSpec rank {ndim}: {weight_spec}")
 
 
