@@ -8,7 +8,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-34A853" alt="Apache 2.0 License"></a>
   <a href="src/"><img src="https://img.shields.io/badge/Engine-C++20%20%2F%20PJRT%20C%20ABI-4285F4" alt="C++20 and PJRT C ABI"></a>
   <a href="benchmarks/"><img src="https://img.shields.io/badge/Kernels-OpenXLA%20%2F%20JAX-FBBC04" alt="OpenXLA and JAX Kernels"></a>
-  <a href="tests/"><img src="https://img.shields.io/badge/Offline%20Tests-55%20Passing-EA4335" alt="55 Offline Tests Passing"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Offline%20Tests-59%20Passing-EA4335" alt="59 Offline Tests Passing"></a>
+  <a href="https://colab.research.google.com/github/adamm285-dev/TPUForge/blob/main/colab/TPUForge_Benchmark.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
+  <a href="https://youtu.be/tTmj9DnFGDc"><img src="https://img.shields.io/badge/Video%20Explainer-Watch%20(9:04)-FF0000?logo=youtube&logoColor=white" alt="Video Explainer (9:04)"></a>
   <a href="assets/audio/TPUForge_Audio_Overview.m4a"><img src="https://img.shields.io/badge/Audio%20Overview-Listen%20(6:16)-purple" alt="Audio Overview (6:16)"></a>
 </p>
 
@@ -16,7 +18,7 @@
   <a href="assets/slides/slide_01.png"><img src="assets/slides/slide_01.png" width="100%" alt="TPUForge: Bridging Eager Execution and Systolic Geometry"></a>
 </p>
 
-> **Audio Overview (6:16):** [**Listen to or download the systems engineering deep dive (`TPUForge_Audio_Overview.m4a`)**](assets/audio/TPUForge_Audio_Overview.m4a), covering Cloud TPU `v6e` Trillium's `256x256` MXU batch-1 paradox (`99.61%` idle rows), C++20 PJRT `StaticArena` (`1` vs `5` compiles, `39.30s` down to `4.46s` on Gemma 4 `12B`), collapsing Gemma 4's `268 MB/step` PCIe logit wall to `1 KB` via HBM `jnp.argmax`, hybrid `DFlash` + zero-KV AST drafting, and `INT8` single-chip fit (`167.54 tok/s` / `30.30x` on `26B-A4B` MoE and `328.97 tok/s` on `12B` with `128/128` exact parity).
+> **Video Explainer (9:04, 720p) &amp; Audio Overview (6:16):** [**Watch the Video Explainer on YouTube**](https://youtu.be/tTmj9DnFGDc) and [**Listen to the Audio Deep Dive (`TPUForge_Audio_Overview.m4a`)**](assets/audio/TPUForge_Audio_Overview.m4a), covering Cloud TPU `v6e` Trillium's `256x256` MXU batch-1 paradox (`99.61%` idle rows), C++20 PJRT `StaticArena` (`1` vs `5` compiles, `39.30s` down to `4.46s` on Gemma 4 `12B`), collapsing Gemma 4's `268 MB/step` PCIe logit wall to `1 KB` via HBM `jnp.argmax`, hybrid `DFlash` + zero-KV AST drafting, and `INT8` single-chip fit (`167.54 tok/s` / `30.30x` on `26B-A4B` MoE and `328.97 tok/s` on `12B` with `128/128` exact parity).
 
 Most LLM serving stacks were built around GPU warps, asynchronous CUDA streams, and dynamic-shape runtime graphs. On Google Cloud TPUs, standard batch-1 token decode leaves `127` of `128` rows idle on a `v5e` Matrix Multiply Unit (`255` of `256` on `v6e` Trillium and `v7`), while unaligned prompt shapes stall behind multi-second XLA recompilations.
 
@@ -29,9 +31,10 @@ Most LLM serving stacks were built around GPU warps, asynchronous CUDA streams, 
 | Mode | Needs Cloud TPU? | Command | What You Verify |
 | :--- | :---: | :--- | :--- |
 | **1. Build C++20 runtime & CLI** | **No** | `cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/tpuforge_bench --tile-size 128` | Native `pjrt_c_api.h` driver, `StaticArena`, and `128`/`256`-row systolic tree packing. |
-| **2. Run offline verification suite** | **No** | `pytest -q` | All `55` offline C++/nanobind, PJRT arena, Gemma 4 (`dense`/`MoE`/`DFlash`/`TP=2`), `INT8`/`FP8`, MoE `mmap`, and AST-seeding checks. |
+| **2. Run offline verification suite** | **No** | `python -m pytest -q` | All `59` offline C++/nanobind, PJRT arena, Serve + HUD parity, Gemma 4 (`dense`/`MoE`/`DFlash`/`TP=2`), `INT8`/`FP8`, MoE `mmap`, and AST-seeding checks. |
 | **3. Run OpenXLA CPU parity bench** | **No** | `python -m benchmarks.run_qwen_bench --model google/gemma-4-12B-it --draft-model z-lab/gemma4-12B-it-DFlash --weight-quant int8 --ast-seed-path .` | `1`-compile static arena (`M-002`), `128`-node hybrid DFlash + AST tree parity (`M-003`/`M-006`/`M-007`), and exact match vs Vanilla JAX. |
 | **4. Run on Cloud TPU (`v5e` / `v6e`)** | **Yes** | Open [`colab/TPUForge_Benchmark.ipynb`](colab/TPUForge_Benchmark.ipynb) or standalone [`benchmarks/results/`](benchmarks/results/) | Multi-chip Ring-Attention (`128k`), Gemma 4 `12B`/`26B-A4B`/`31B`, `INT8` single-chip fit, `mmap` MoE streaming, and `Qwen3-4B` check. |
+| **5. Launch Preset Server &amp; Live HUD** | **No** | `python -m benchmarks.tpuforge_serve gemma4:12b --ast-seed-path .` | Ollama-style TPU preset autofit, OpenAI `/v1/chat/completions` SSE API, and interactive `128`/`256`-lane Systolic Matrix HUD. |
 
 ```bash
 # Local native C++20 build + offline verification suite (Clang/GCC/MSVC + CMake + Ninja)
@@ -153,12 +156,12 @@ All Phase 1 silicon numbers below were measured on Cloud TPU `v5e-1` (`TPU v5 li
 
 Context-only suffix drafting drops to **`1.27x` (`7B`)** and **`1.26x` (`3B`)** when prompts share no prior n-grams. TPUForge implements four extensions to handle cold codegen, single-chip memory caps, and sparse MoE capacity across both Gemma 4 and Qwen3:
 
-| Extension | Implemented Mechanism | Offline Verification Status (`55/55` pytest) | Cloud TPU Status |
+| Extension | Implemented Mechanism | Offline Verification Status (`59/59` pytest) | Cloud TPU Status |
 | :--- | :--- | :--- | :--- |
 | **`M-006`: Hybrid Block-Diffusion Tree** (`tpuforge_block_tree`) | `Gemma4BlockTreeRunner` (`benchmarks/gemma4_jax.py`) + `QwenBlockTreeRunner` (`benchmarks/block_diffusion_jax.py`) fuse parallel `DFlash` block-drafter `top-k` predictions with `O(1)` `SuffixIndex` continuations via `TreeBuilder::build_from_block_top_k`. | Verified (`test_block_tree_and_suffix.py` & `test_gemma4.py`): sub-`15 ms` tree packing at `32K+`, 4-mode parity, `transpose_lm_head` tied reuse, `TP=2` HLO green. | **Verified `v6e-1` Silicon**: `328.97 tok/s` (`12B INT8`), `167.54 tok/s` (`26B-A4B INT8`), `900.55 tok/s` (`Qwen3-4B`) |
 | **`M-009`: Out-of-Band Repository AST Seeding** | `benchmarks/ast_seed_jax.py`, `SuffixIndex::seed_sequences`, `ForgeEngine::seed_ast_text`, `--ast-seed-path`, and HTTP `"seed_snippets"` pre-warm cold codegen drafting at zero prompt/KV cost. | Verified (`test_ast_seed_drafter.py`): Python/C++ AST extraction, exact greedy parity, 1-token fallback. | **Verified `v6e-1` Silicon** (`78,096` AST tokens): `244.28 tok/s` (`12B INT8`), `125.83 tok/s` (`26B-A4B`), `764.05 tok/s` (`Qwen3-4B`) |
 | **`M-007`: Native `INT8` / `FP8` Systolic Kernels** | `benchmarks/quantization_jax.py` computes pre-sharding symmetric per-channel `int8` / `float8_e4m3fn` weights and scales (`>=2D` N-D periodic scan specs) executed via constant-free `jax.lax.dot_general`. | Verified (`test_quantized_systolic.py` & `test_gemma4.py`): `< 0.65x` linear HBM footprint vs `BF16`, Gemma 4 `INT8`/`FP8` 4-mode parity, `TP=2` `all-reduce` HLO. | **Verified `v6e-1` Silicon**: `12.97 GiB` vs `22.18 GiB` `12B` (`0.585x`), `24.95 GiB` `26B-A4B`, `1.64x` Static decode |
-| **`M-008`: Host `mmap` Sparse MoE Streaming** | `benchmarks/moe_streaming_jax.py` + `Gemma4MoeStreamRunner` pin attention, routers, and KV caches in HBM while `ExpertHostStore` streams routed `3D` stacked or `2D` experts from `mmap` into `E_stage` slots amortized across `128` tree nodes. | Verified (`test_moe_streaming.py` & `test_gemma4.py`): `< 30%` Gemma 4 HBM trunk ratio (`< 45%` OLMoE), `0` steady-state recompiles, Windows `mmap` release verified. | Verified offline (`55/55` pytest); staged for `15.75 GiB` `v5e-1` (`26B-A4B INT8` fit 100% in `v6e-1` HBM) |
+| **`M-008`: Host `mmap` Sparse MoE Streaming** | `benchmarks/moe_streaming_jax.py` + `Gemma4MoeStreamRunner` pin attention, routers, and KV caches in HBM while `ExpertHostStore` streams routed `3D` stacked or `2D` experts from `mmap` into `E_stage` slots amortized across `128` tree nodes. | Verified (`test_moe_streaming.py` & `test_gemma4.py`): `< 30%` Gemma 4 HBM trunk ratio (`< 45%` OLMoE), `0` steady-state recompiles, Windows `mmap` release verified. | Verified offline (`59/59` pytest); staged for `15.75 GiB` `v5e-1` (`26B-A4B INT8` fit 100% in `v6e-1` HBM) |
 
 *(Multi-chip `v5e-8` `TP=8` runs and `M-008` `v5e-1` host `mmap` streaming remain labeled honestly above until their own Cloud TPU JSON telemetry completes.)*
 
@@ -202,7 +205,7 @@ Context-only suffix drafting drops to **`1.27x` (`7B`)** and **`1.26x` (`3B`)** 
            (Development / Simulation)      (`libpjrt_tpu.so` / Silicon)
 ```
 
-1. **Serving Ingress (`M-004`):** Native C++20 HTTP/1.1 `/v1/chat/completions` server (`OpenAIServer`) with `ByteTokenizer`, `Utf8StreamDecoder`, SSE streaming, `nanobind` `_tpuforge_ext` Python bindings, and out-of-band `"seed_snippets"` support.
+1. **Serving Ingress &amp; Live Systolic HUD (`M-004`):** Ollama-style hardware-autofit launcher (`benchmarks.tpuforge_serve`) and Live Systolic Matrix HUD (`benchmarks.hud_ui`) alongside the native C++20 HTTP/1.1 `/v1/chat/completions` server (`OpenAIServer`) with SSE telemetry streaming, `nanobind` `_tpuforge_ext` Python bindings, and out-of-band `/api/seed` AST indexing.
 2. **`O(1)` `SuffixIndex` & Hybrid Block-Diffusion Packing (`M-003`, `M-006`, `M-009`):** Incremental 1-to-4-gram suffix hash index merges repository AST declarations and parallel `DFlash` `top-k` candidates into fixed `128`- or `256`-row causal tiles via `TreeBuilder::build_from_block_top_k`.
 3. **Mixed-Precision & Tied-Embedding Kernels (`M-002`, `M-007`):** `StaticArena` (`128`-byte alignment) and constant-free weight tuples execute `bfloat16` activations against `int8`/`float8_e4m3fn` per-channel weights while reusing tied `embed_tokens` directly on Gemma 4 (`transpose_lm_head=True`).
 4. **Host `mmap` Sparse MoE Expert Streaming (`M-008`):** `ExpertHostStore` streams active routed experts (`3D` stacked Gemma 4 / `Qwen3-MoE` or `2D` `OLMoE`) from `mmap` into fixed-shape `E_stage` HBM buffers amortized across all `128` speculative candidates simultaneously.
@@ -226,6 +229,11 @@ python -m benchmarks.run_qwen_bench --model google/gemma-4-12B-it --draft-model 
 # Google Gemma 4 31B Dense + DFlash via Megatron TP=8 (pooled 128 GiB v5e-8)
 python -m benchmarks.run_qwen_bench --model google/gemma-4-31B-it --draft-model z-lab/gemma-4-31B-it-DFlash --ast-seed-path . --tile-size auto --tp-size 8
 
+# Ollama-style TPU Forge Serve presets, OpenAI /v1 endpoint, and Live Systolic HUD
+python -m benchmarks.tpuforge_serve --list-presets
+python -m benchmarks.tpuforge_serve gemma4:12b --ast-seed-path .
+python -m benchmarks.tpuforge_serve gemma4:26b --ast-seed-path .
+
 # M-005 Optical Torus Ring-Attention & standalone Kaggle/Colab bundle builder
 python -m benchmarks.ring_attention_jax --max-seq-len 8192 --valid-seq-len 6144 --ring-size auto --tp-size 1
 python -m benchmarks.package_kaggle_bundle
@@ -233,15 +241,15 @@ python -m benchmarks.package_kaggle_bundle
 
 | Hardware Target | Status | Scope |
 | :--- | :--- | :--- |
-| **Local CPU (PJRT CPU)** | Verified (`55/55` pytest) | `128`/`256` tile simulation, Gemma 4 periodic `5:1` scan + `3D` MoE + `DFlash` + `INT8`/`FP8` + `mmap` + `TP=2`, `O(1)` `SuffixIndex` + AST seeding, OpenXLA GSPMD TP parity |
+| **Local CPU (PJRT CPU)** | Verified (`59/59` pytest) | `128`/`256` tile simulation, Preset Serve + Live HUD SSE parity, Gemma 4 periodic `5:1` scan + `3D` MoE + `DFlash` + `INT8`/`FP8` + `mmap` + `TP=2`, `O(1)` `SuffixIndex` + AST seeding, OpenXLA GSPMD TP parity |
 | **Cloud TPU `v5e-1` (`15.75 GiB` HBM)** | Verified Silicon (`Qwen2.5`) / Staged (`Gemma 4`) | Verified: `32K` Flash-Ring (`519,735 tok/s`), `3B` (`328.79 tok/s`), `7B` (`202.80 tok/s`), `tile=128` vs `256` (`1.23x`). Staged: Gemma 4 `12B INT8` (`13.97 GiB`), `26B-A4B mmap INT8`, `Qwen3-4B` check |
 | **Cloud TPU `v6e-1` (`31.24 GiB` HBM, Trillium)** | **Verified Silicon (`Gemma 4` + `Qwen3-4B`)** | `tile=256`: `Gemma 4 26B-A4B INT8` (`24.95 GiB`, `167.54 tok/s`, `30.30x` vs Vanilla), `12B INT8` (`12.97 GiB`, `328.97 tok/s`), `12B BF16` (`22.18 GiB`, `186.95 tok/s`), `Qwen3-4B` (`900.55 tok/s`), `M-005` (`638,908 tok/s` prefill, `229,305` tree-nodes/s) |
 | **Kaggle Free TPU `v5e-8` (`128 GiB` HBM)** | Queued / Staged | `8x16 GiB` pooled HBM: `128K` ICI Ring-Attention (`M-005`), Gemma 4 `26B-A4B` `TP=8`, `31B` `TP=8` (`9.80 GiB/chip` tied `BF16`), and `12B` tile sweep |
 
 * `include/`: Public C/C++ engine headers (`pjrt_c_api.h`, `kv_cache.h`, `tree_speculator.h`, `openai_server.h`, `engine.h`).
 * `src/`: Core C++20 implementation (`core/`, `ops/`, `speculative/`, `runtime/`).
-* `benchmarks/`: OpenXLA/JAX modules (`gemma4_jax.py`, `qwen_jax.py`, `quantization_jax.py`, `moe_streaming_jax.py`, `ast_seed_jax.py`, `block_diffusion_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
-* `tests/`: `55` offline unit, C++/nanobind, XLA sharding, Gemma 4, quantized systolic, sparse MoE streaming, AST-seeding, block-tree, and ring-attention tests (`pytest`).
+* `benchmarks/`: OpenXLA/JAX modules (`tpuforge_serve.py`, `hud_ui.py`, `gemma4_jax.py`, `qwen_jax.py`, `quantization_jax.py`, `moe_streaming_jax.py`, `ast_seed_jax.py`, `block_diffusion_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
+* `tests/`: `59` offline unit, C++/nanobind, Serve + HUD parity, XLA sharding, Gemma 4, quantized systolic, sparse MoE streaming, AST-seeding, block-tree, and ring-attention tests (`pytest`).
 * `docs/`: Architecture and TRC proposal notes ([`docs/TRC_APPLICATION.md`](docs/TRC_APPLICATION.md)).
 * `assets/slides/`: Dark-mode architectural slide deck (`slide_01.png`..`slide_08.png`) and Gemma 4 `v6e-1` Trillium benchmark chart (`gemma4_v6e_benchmark_chart.png`).
 * `assets/audio/`: Systems engineering audio overview (`TPUForge_Audio_Overview.m4a`, `6:16`).

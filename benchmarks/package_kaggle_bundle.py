@@ -20,6 +20,8 @@ DEFAULT_INCLUDE_PATHS = (
     "benchmarks/block_diffusion_jax.py",
     "benchmarks/ring_attention_jax.py",
     "benchmarks/run_qwen_bench.py",
+    "benchmarks/hud_ui.py",
+    "benchmarks/tpuforge_serve.py",
     "benchmarks/package_kaggle_bundle.py",
     "benchmarks/__init__.py",
     "tests/fixtures/pjrt_test_plugin.c",
