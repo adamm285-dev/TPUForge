@@ -11,7 +11,9 @@
   <a href="tests/"><img src="https://img.shields.io/badge/Offline%20Tests-55%20Passing-EA4335" alt="55 Offline Tests Passing"></a>
 </p>
 
-<!-- SLIDE_01: assets/slides/slide_01.png -->
+<p align="center">
+  <a href="assets/slides/slide_01.png"><img src="assets/slides/slide_01.png" width="100%" alt="TPUForge: Bridging Eager Execution and Systolic Geometry"></a>
+</p>
 
 Most LLM serving stacks were built around GPU warps, asynchronous CUDA streams, and dynamic-shape runtime graphs. On Google Cloud TPUs, standard batch-1 token decode leaves `127` of `128` rows idle on a `v5e` Matrix Multiply Unit (`255` of `256` on `v6e` Trillium and `v7`), while unaligned prompt shapes stall behind multi-second XLA recompilations.
 
@@ -52,8 +54,10 @@ pytest -q
 
 ## 1. Target Lineup: Google Gemma 4 on Cloud TPUs
 
-<!-- SLIDE_02: assets/slides/slide_02.png -->
-<!-- SLIDE_03: assets/slides/slide_03.png -->
+<p align="center">
+  <a href="assets/slides/slide_02.png"><img src="assets/slides/slide_02.png" width="49%" alt="Google Gemma 4 Pure-JAX Hardware Mapping"></a>
+  <a href="assets/slides/slide_03.png"><img src="assets/slides/slide_03.png" width="49%" alt="Eradicating the 262K Vocabulary Bottleneck"></a>
+</p>
 
 All flagship runs use ungated `Apache 2.0` Google Gemma 4 weights implemented natively in pure JAX/OpenXLA ([`benchmarks/gemma4_jax.py`](benchmarks/gemma4_jax.py)) without `transformers` or `torch` runtime overhead:
 
@@ -74,8 +78,10 @@ All flagship runs use ungated `Apache 2.0` Google Gemma 4 weights implemented na
 
 ## 2. Verified Cloud TPU Silicon Telemetry (`v6e-1` Trillium & `v5e-1`)
 
-<!-- SLIDE_04: assets/slides/slide_04.png -->
-<!-- SLIDE_05: assets/slides/slide_05.png -->
+<p align="center">
+  <a href="assets/slides/slide_04.png"><img src="assets/slides/slide_04.png" width="49%" alt="Live Cloud TPU v6e Trillium Telemetry"></a>
+  <a href="assets/slides/slide_05.png"><img src="assets/slides/slide_05.png" width="49%" alt="Zero-Recompilation via StaticArena"></a>
+</p>
 
 ### Cloud TPU `v6e-1` Trillium (`TPU v6 lite`, `31.24 GiB` HBM, `tile=256`, `JAX 0.11.2`)
 
@@ -133,8 +139,10 @@ All Phase 1 silicon numbers below were measured on Cloud TPU `v5e-1` (`TPU v5 li
 
 ## 3. Cold-Prompt Drafting, Quantization, & MoE Extensions (`M-006`..`M-008`)
 
-<!-- SLIDE_06: assets/slides/slide_06.png -->
-<!-- SLIDE_07: assets/slides/slide_07.png -->
+<p align="center">
+  <a href="assets/slides/slide_06.png"><img src="assets/slides/slide_06.png" width="49%" alt="Cold-Prompt Drafting Engine"></a>
+  <a href="assets/slides/slide_07.png"><img src="assets/slides/slide_07.png" width="49%" alt="Precision Compression and Expert Streaming"></a>
+</p>
 
 Context-only suffix drafting drops to **`1.27x` (`7B`)** and **`1.26x` (`3B`)** when prompts share no prior n-grams. TPUForge implements four extensions to handle cold codegen, single-chip memory caps, and sparse MoE capacity across both Gemma 4 and Qwen3:
 
@@ -151,7 +159,9 @@ Context-only suffix drafting drops to **`1.27x` (`7B`)** and **`1.26x` (`3B`)** 
 
 ## 4. Architecture and Subsystem Design
 
-<!-- SLIDE_08: assets/slides/slide_08.png -->
+<p align="center">
+  <a href="assets/slides/slide_08.png"><img src="assets/slides/slide_08.png" width="100%" alt="System Scale and The Serving Stack"></a>
+</p>
 
 ```
         +-----------------------------------------------------------------+
@@ -226,6 +236,7 @@ python -m benchmarks.package_kaggle_bundle
 * `benchmarks/`: OpenXLA/JAX modules (`gemma4_jax.py`, `qwen_jax.py`, `quantization_jax.py`, `moe_streaming_jax.py`, `ast_seed_jax.py`, `block_diffusion_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
 * `tests/`: `55` offline unit, C++/nanobind, XLA sharding, Gemma 4, quantized systolic, sparse MoE streaming, AST-seeding, block-tree, and ring-attention tests (`pytest`).
 * `docs/`: Architecture and TRC proposal notes ([`docs/TRC_APPLICATION.md`](docs/TRC_APPLICATION.md)).
+* `assets/slides/`: Dark-mode architectural and Cloud TPU `v6e-1` Trillium telemetry slide deck (`slide_01.png`..`slide_08.png`).
 
 ---
 
