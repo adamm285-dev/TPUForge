@@ -9,11 +9,14 @@
   <a href="src/"><img src="https://img.shields.io/badge/Engine-C++20%20%2F%20PJRT%20C%20ABI-4285F4" alt="C++20 and PJRT C ABI"></a>
   <a href="benchmarks/"><img src="https://img.shields.io/badge/Kernels-OpenXLA%20%2F%20JAX-FBBC04" alt="OpenXLA and JAX Kernels"></a>
   <a href="tests/"><img src="https://img.shields.io/badge/Offline%20Tests-55%20Passing-EA4335" alt="55 Offline Tests Passing"></a>
+  <a href="assets/audio/TPUForge_Audio_Overview.m4a"><img src="https://img.shields.io/badge/Audio%20Overview-Listen%20(6:16)-purple" alt="Audio Overview (6:16)"></a>
 </p>
 
 <p align="center">
   <a href="assets/slides/slide_01.png"><img src="assets/slides/slide_01.png" width="100%" alt="TPUForge: Bridging Eager Execution and Systolic Geometry"></a>
 </p>
+
+> **Audio Overview (6:16):** [**Listen to or download the systems engineering deep dive (`TPUForge_Audio_Overview.m4a`)**](assets/audio/TPUForge_Audio_Overview.m4a), covering Cloud TPU `v6e` Trillium's `256x256` MXU batch-1 paradox (`99.61%` idle rows), C++20 PJRT `StaticArena` (`1` vs `5` compiles, `39.30s` down to `4.46s` on Gemma 4 `12B`), collapsing Gemma 4's `268 MB/step` PCIe logit wall to `1 KB` via HBM `jnp.argmax`, hybrid `DFlash` + zero-KV AST drafting, and `INT8` single-chip fit (`167.54 tok/s` / `30.30x` on `26B-A4B` MoE and `328.97 tok/s` on `12B` with `128/128` exact parity).
 
 Most LLM serving stacks were built around GPU warps, asynchronous CUDA streams, and dynamic-shape runtime graphs. On Google Cloud TPUs, standard batch-1 token decode leaves `127` of `128` rows idle on a `v5e` Matrix Multiply Unit (`255` of `256` on `v6e` Trillium and `v7`), while unaligned prompt shapes stall behind multi-second XLA recompilations.
 
@@ -237,6 +240,7 @@ python -m benchmarks.package_kaggle_bundle
 * `tests/`: `55` offline unit, C++/nanobind, XLA sharding, Gemma 4, quantized systolic, sparse MoE streaming, AST-seeding, block-tree, and ring-attention tests (`pytest`).
 * `docs/`: Architecture and TRC proposal notes ([`docs/TRC_APPLICATION.md`](docs/TRC_APPLICATION.md)).
 * `assets/slides/`: Dark-mode architectural and Cloud TPU `v6e-1` Trillium telemetry slide deck (`slide_01.png`..`slide_08.png`).
+* `assets/audio/`: Systems engineering audio overview (`TPUForge_Audio_Overview.m4a`, `6:16`).
 
 ---
 
