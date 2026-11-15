@@ -3,7 +3,7 @@
 **Project Title:** TPU Forge (TPUForge): High-Throughput Native Inference Engine for Google Cloud TPUs  
 **Primary Contact:** Adam (floorsmithllc / CineClearAI)  
 **Target Hardware:** Cloud TPU v5e / Cloud TPU v6e (Trillium)  
-**Open Source Repository:** https://github.com/adamm285/TPUForge-dev  
+**Open Source Repository:** https://github.com/adamm285-dev/TPUForge  
 
 ---
 
