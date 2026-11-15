@@ -916,15 +916,266 @@ def encode_chat_messages(
     return [int(t) for t in encoded.ids]
 
 
-def resolve_model_dir(model_id_or_path: str) -> Path:
-    """Return local Path if existing directory, else download config/tokenizer/safetensors via HF Hub."""
-    candidate = Path(model_id_or_path)
-    if candidate.is_dir():
-        return candidate
+_STATIC_LOCAL_MODEL_ROOTS: tuple[Path, ...] = (
+    Path("H:/Caches/huggingface/hub"),
+    Path("F:/Caches/huggingface/hub"),
+    Path("C:/Caches/huggingface/hub"),
+    Path("C:/AI_Models"),
+    Path("F:/AI_Models"),
+    Path("H:/AI_Models"),
+)
+
+
+def _safe_is_dir(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_dir()
+    except OSError:
+        return False
+
+
+def _is_complete_safetensors_dir(path: Path) -> bool:
+    """Return True only when config.json and every required .safetensors shard exist on disk."""
+    if not _safe_is_dir(path) or not (path / "config.json").is_file():
+        return False
+
+    index_path = path / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index_data = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        if not isinstance(index_data, dict):
+            return False
+        weight_map = index_data.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            return False
+        try:
+            root_resolved = path.resolve()
+            for shard_name in set(weight_map.values()):
+                if not isinstance(shard_name, str) or not shard_name.strip():
+                    return False
+                shard_resolved = (path / shard_name).resolve()
+                if not shard_resolved.is_relative_to(root_resolved) or not shard_resolved.is_file():
+                    return False
+        except (OSError, ValueError):
+            return False
+        return True
+
+    if (path / "model.safetensors").is_file():
+        return True
+    try:
+        return any(path.glob("*.safetensors"))
+    except OSError:
+        return False
+
+
+def default_local_model_roots() -> list[Path]:
+    """Return deduplicated existing local Hugging Face / checkpoint roots across configured drives."""
+    raw_candidates: list[Path] = []
+    env_dirs = os.environ.get("TPUFORGE_MODEL_DIRS", "").strip()
+    if env_dirs:
+        for entry in env_dirs.split(os.pathsep):
+            cleaned = entry.strip()
+            if cleaned:
+                raw_candidates.append(Path(cleaned).expanduser())
+    for env_key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            raw_candidates.append(Path(val).expanduser())
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        raw_candidates.append(Path(hf_home).expanduser() / "hub")
+    raw_candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+    raw_candidates.extend(_STATIC_LOCAL_MODEL_ROOTS)
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for cand in raw_candidates:
+        if not _safe_is_dir(cand):
+            continue
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(cand)
+    return roots
+
+
+def _pick_hf_snapshot(hub_model_dir: Path) -> Path | None:
+    """Return the preferred complete snapshot directory inside an HF hub cache models--* folder."""
+    snapshots_dir = hub_model_dir / "snapshots"
+    if not _safe_is_dir(snapshots_dir):
+        return None
+    ref_main = hub_model_dir / "refs" / "main"
+    try:
+        if ref_main.is_file():
+            rev = ref_main.read_text(encoding="utf-8").strip()
+            if rev:
+                snap = snapshots_dir / rev
+                if _is_complete_safetensors_dir(snap):
+                    return snap
+    except OSError:
+        pass
+
+    try:
+        candidates = [p for p in snapshots_dir.iterdir() if _safe_is_dir(p)]
+    except OSError:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for snap in candidates:
+        if _is_complete_safetensors_dir(snap):
+            return snap
+    return None
+
+
+def _classify_checkpoint_config(model_dir: Path) -> dict[str, Any]:
+    """Read compact architecture metadata from config.json for local discovery tables."""
+    try:
+        raw = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {
+            "arch": "unknown",
+            "model_type": "unknown",
+            "is_dflash_drafter": False,
+            "hidden_size": None,
+            "num_hidden_layers": None,
+        }
+    if not isinstance(raw, dict):
+        raw = {}
+    text_cfg = raw.get("text_config") if isinstance(raw.get("text_config"), dict) else {}
+    model_type = str(raw.get("model_type") or text_cfg.get("model_type") or "unknown")
+    is_drafter = bool("dflash_config" in raw or "target_layer_ids" in raw)
+    if is_drafter:
+        arch = "dflash"
+    elif model_type.startswith("gemma4"):
+        arch = "gemma4"
+    else:
+        arch = model_type
+    hidden_size = raw.get("hidden_size") if "hidden_size" in raw else text_cfg.get("hidden_size")
+    num_layers = (
+        raw.get("num_hidden_layers")
+        if "num_hidden_layers" in raw
+        else text_cfg.get("num_hidden_layers")
+    )
+    return {
+        "arch": arch,
+        "model_type": model_type,
+        "is_dflash_drafter": is_drafter,
+        "hidden_size": hidden_size,
+        "num_hidden_layers": num_layers,
+    }
+
+
+def discover_local_models(
+    search_roots: Sequence[str | Path] | None = None,
+) -> list[dict[str, Any]]:
+    """Scan local model directories and HF hub caches for complete safetensors checkpoints."""
+    roots = (
+        [Path(r).expanduser() for r in search_roots]
+        if search_roots is not None
+        else default_local_model_roots()
+    )
+    discovered: list[dict[str, Any]] = []
+    seen_dirs: set[Path] = set()
+
+    def _record(repo_id: str, model_dir: Path, source: str) -> None:
+        try:
+            resolved = model_dir.resolve()
+        except OSError:
+            return
+        if resolved in seen_dirs:
+            return
+        seen_dirs.add(resolved)
+        meta = _classify_checkpoint_config(model_dir)
+        discovered.append(
+            {
+                "repo_id": repo_id,
+                "local_dir": str(model_dir),
+                "source": source,
+                **meta,
+            }
+        )
+
+    for root in roots:
+        if not _safe_is_dir(root):
+            continue
+        try:
+            children = sorted(root.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for child in children:
+            if not _safe_is_dir(child):
+                continue
+            if child.name.startswith("models--") and "--" in child.name[len("models--") :]:
+                snap = _pick_hf_snapshot(child)
+                if snap is not None:
+                    repo_id = child.name[len("models--") :].replace("--", "/", 1)
+                    _record(repo_id, snap, "hf_cache")
+                continue
+            if _is_complete_safetensors_dir(child):
+                _record(child.name, child, "direct")
+                continue
+            if child.name.startswith(".") or child.name in ("snapshots", "refs", "blobs"):
+                continue
+            try:
+                subdirs = sorted(child.iterdir(), key=lambda p: p.name)
+            except OSError:
+                continue
+            for sub in subdirs:
+                if _is_complete_safetensors_dir(sub):
+                    _record(f"{child.name}/{sub.name}", sub, "direct")
+
+    return discovered
+
+
+def resolve_model_dir(
+    model_id_or_path: str | Path,
+    *,
+    search_roots: Sequence[str | Path] | None = None,
+    allow_download: bool = True,
+) -> Path:
+    """Resolve a local/HF model directory after validating complete safetensors shards."""
+    raw = str(model_id_or_path).strip()
+    if not raw:
+        raise ValueError("model_id_or_path must be a non-empty repo ID or directory path")
+
+    candidate = Path(raw).expanduser()
+    if _safe_is_dir(candidate):
+        if _is_complete_safetensors_dir(candidate):
+            return candidate
+        raise FileNotFoundError(
+            f"Local model directory is incomplete (missing config.json or .safetensors shards): {candidate}"
+        )
+
+    roots = (
+        [Path(r).expanduser() for r in search_roots]
+        if search_roots is not None
+        else default_local_model_roots()
+    )
+    for root in roots:
+        if not _safe_is_dir(root):
+            continue
+        for direct in (root / raw, root / Path(raw).name):
+            if _is_complete_safetensors_dir(direct):
+                return direct
+        if "/" in raw:
+            hub_dir = root / ("models--" + raw.replace("/", "--"))
+            snap = _pick_hf_snapshot(hub_dir)
+            if snap is not None:
+                return snap
+
+    if not allow_download:
+        raise FileNotFoundError(
+            f"Model {raw!r} was not found in local model roots ({[str(r) for r in roots]}) "
+            "and network downloads are disabled (--local-only)."
+        )
+
     from huggingface_hub import snapshot_download
 
     downloaded = snapshot_download(
-        repo_id=model_id_or_path,
+        repo_id=raw,
         allow_patterns=["*.json", "*.safetensors", "tokenizer*", "*.txt"],
     )
     return Path(downloaded)

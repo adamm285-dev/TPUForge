@@ -19,7 +19,11 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         var urlTheme = params.get("theme");
         var stored = window.localStorage ? window.localStorage.getItem("tpuforge-theme") : null;
         var chosen = urlTheme === "dark" || urlTheme === "light" ? urlTheme : stored;
+        var meta = document.querySelector('meta[name="color-scheme"]');
         if (chosen === "dark" || chosen === "light") {
+          if (meta) {
+            meta.content = chosen;
+          }
           document.documentElement.setAttribute("data-theme", chosen);
         }
       } catch (_err) {
@@ -111,10 +115,12 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         }
       }
 
+      :root:has(> head > meta[name="color-scheme"][content="dark"]),
       html[data-theme="dark"] {
         color-scheme: dark;
       }
 
+      :root:has(> head > meta[name="color-scheme"][content="light"]),
       html[data-theme="light"] {
         color-scheme: light;
       }
@@ -253,6 +259,7 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         border: 0.0625rem solid var(--border);
         font-size: 0.82rem;
         font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
       }
 
       button {
@@ -323,6 +330,19 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         gap: 0.875rem;
       }
 
+      @supports (content-visibility: auto) {
+        .isolated-panel {
+          content-visibility: auto;
+          contain-intrinsic-size: auto 360px auto 520px;
+        }
+      }
+
+      @supports not (content-visibility: auto) {
+        .isolated-panel {
+          contain: layout style paint;
+        }
+      }
+
       .panel-header {
         display: flex;
         flex-wrap: wrap;
@@ -351,6 +371,7 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
 
       .kpi-value {
         font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
         font-size: 1.15rem;
         font-weight: 700;
         margin-top: 0.125rem;
@@ -523,11 +544,11 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         font-family: var(--font-mono);
       }
 
-      input:user-invalid, textarea:user-invalid {
+      :is(input, textarea):is(:user-invalid, .user-invalid-fallback) {
         border-color: var(--accent-red);
       }
 
-      input:user-valid {
+      input:is(:user-valid, .user-valid-fallback) {
         border-color: var(--accent-green);
       }
 
@@ -548,7 +569,8 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
       }
 
       .table-scroll {
-        overflow-x: auto;
+        overflow: auto;
+        container-type: inline-size;
         border: 0.0625rem solid var(--border);
         border-radius: 0.5rem;
         max-height: 15rem;
@@ -556,9 +578,16 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
 
       table.pulse-table {
         width: 100%;
-        border-collapse: collapse;
+        border-collapse: separate;
+        border-spacing: 0;
         font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
         font-size: 0.8rem;
+        --col-2: "Accepted";
+        --col-3: "Drafted";
+        --col-4: "Fill";
+        --col-5: "Step ms";
+        --col-6: "Prefix";
       }
 
       table.pulse-table th,
@@ -571,9 +600,77 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
 
       table.pulse-table thead th {
         position: sticky;
-        top: 0;
+        inset-block-start: 0;
+        z-index: 2;
         background-color: var(--surface-2);
         font-weight: 700;
+      }
+
+      table.pulse-table tbody th {
+        position: sticky;
+        inset-inline-start: 0;
+        z-index: 1;
+        background-color: var(--surface);
+        font-weight: 700;
+      }
+
+      @container (width < 36rem) {
+        table.pulse-table,
+        table.pulse-table thead,
+        table.pulse-table tbody,
+        table.pulse-table tr,
+        table.pulse-table th,
+        table.pulse-table td {
+          display: block;
+        }
+
+        table.pulse-table thead {
+          display: none;
+        }
+
+        table.pulse-table tbody tr {
+          margin: 0.5rem;
+          border: 0.0625rem solid var(--border);
+          border-radius: 0.375rem;
+          background-color: var(--surface);
+        }
+
+        table.pulse-table tbody th {
+          position: sticky;
+          inset-block-start: 0;
+          z-index: 2;
+          background-color: var(--surface-2);
+        }
+
+        table.pulse-table tbody td:nth-child(2)::before {
+          content: var(--col-2) ": ";
+          font-weight: 600;
+          color: var(--text-muted);
+        }
+
+        table.pulse-table tbody td:nth-child(3)::before {
+          content: var(--col-3) ": ";
+          font-weight: 600;
+          color: var(--text-muted);
+        }
+
+        table.pulse-table tbody td:nth-child(4)::before {
+          content: var(--col-4) ": ";
+          font-weight: 600;
+          color: var(--text-muted);
+        }
+
+        table.pulse-table tbody td:nth-child(5)::before {
+          content: var(--col-5) ": ";
+          font-weight: 600;
+          color: var(--text-muted);
+        }
+
+        table.pulse-table tbody td:nth-child(6)::before {
+          content: var(--col-6) ": ";
+          font-weight: 600;
+          color: var(--text-muted);
+        }
       }
 
       dialog {
@@ -656,7 +753,7 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
       <span class="badge-pill" id="kpi-hardware">Tile: -- | TP: -- | Quant: --</span>
       <button type="button" id="open-seed-btn">AST Context Seed</button>
       <button type="button" id="open-connect-btn">API / Colab Connect</button>
-      <button type="button" id="theme-toggle-btn" aria-label="Toggle color theme">Theme</button>
+      <button type="button" id="theme-toggle-btn" aria-pressed="false" aria-label="Toggle color theme">Theme</button>
     </div>
   </header>
 
@@ -721,7 +818,8 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
               inputmode="numeric"
               pattern="[0-9]*"
               value="64"
-              aria-describedby="max-tokens-error"
+              aria-invalid="false"
+              data-error="max-tokens-error"
               required
             >
             <div id="max-tokens-error" class="field-error"></div>
@@ -733,7 +831,8 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
           <textarea
             id="prompt-input"
             placeholder="Write a prompt or paste code to refactor using AST suffix + DFlash acceleration..."
-            aria-describedby="prompt-error"
+            aria-invalid="false"
+            data-error="prompt-error"
             required
           >Write a Python helper using OpenXLA static shapes.</textarea>
           <div id="prompt-error" class="field-error"></div>
@@ -746,7 +845,7 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
       </form>
     </section>
 
-    <aside class="panel" aria-labelledby="telemetry-heading">
+    <aside class="panel isolated-panel" aria-labelledby="telemetry-heading">
       <div class="panel-header">
         <h2 id="telemetry-heading">Live Systolic Matrix Fill</h2>
         <span class="badge-pill" id="tile-fill-badge">0 / 128 lanes</span>
@@ -782,7 +881,7 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
 
       <section aria-labelledby="pulse-heading">
         <h3 id="pulse-heading" style="margin-bottom: 0.4rem;">Recent Systolic Pulses</h3>
-        <div class="table-scroll" tabindex="0">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="pulse-heading">
           <table class="pulse-table">
             <thead>
               <tr>
@@ -958,11 +1057,17 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         }
         document.getElementById("tile-fill-badge").textContent =
           draftedNodes + " / " + tileSize + " lanes (" + Math.round((draftedNodes / tileSize) * 100) + "%)";
+      }
 
-        var tbody = document.getElementById("pulse-tbody");
+      function appendPulseRow(tbody, pulse) {
+        var draftedNodes = Number(pulse.drafted_nodes) || 0;
         var tr = document.createElement("tr");
+        var rowHdr = document.createElement("th");
+        rowHdr.setAttribute("scope", "row");
+        rowHdr.textContent = String(pulse.step_index || 0);
+        tr.appendChild(rowHdr);
+
         var cols = [
-          String(pulse.step_index || 0),
           String((pulse.accepted_rows || []).length),
           String(draftedNodes),
           Math.round((draftedNodes / tileSize) * 100) + "%",
@@ -975,8 +1080,66 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
           tr.appendChild(td);
         }
         tbody.insertBefore(tr, tbody.firstChild);
-        while (tbody.children.length > 32) {
-          tbody.removeChild(tbody.lastChild);
+      }
+
+      var pendingPulse = null;
+      var pendingPulseRows = [];
+      var pulseRafId = 0;
+      var pulseRafUsesTimeout = false;
+
+      function flushPulseFrame() {
+        pulseRafId = 0;
+        pulseRafUsesTimeout = false;
+        if (pendingPulse) {
+          var latest = pendingPulse;
+          pendingPulse = null;
+          renderPulse(latest);
+        }
+        if (pendingPulseRows.length > 0) {
+          var rows = pendingPulseRows;
+          pendingPulseRows = [];
+          var tbody = document.getElementById("pulse-tbody");
+          var startIdx = rows.length > 32 ? rows.length - 32 : 0;
+          for (var r = startIdx; r < rows.length; r++) {
+            appendPulseRow(tbody, rows[r]);
+          }
+          while (tbody.children.length > 32) {
+            tbody.removeChild(tbody.lastChild);
+          }
+        }
+      }
+
+      function resetPulseQueue() {
+        if (pulseRafId) {
+          if (!pulseRafUsesTimeout && typeof window.cancelAnimationFrame === "function") {
+            window.cancelAnimationFrame(pulseRafId);
+          } else {
+            clearTimeout(pulseRafId);
+          }
+          pulseRafId = 0;
+          pulseRafUsesTimeout = false;
+        }
+        pendingPulse = null;
+        pendingPulseRows = [];
+      }
+
+      function enqueuePulse(pulse) {
+        if (!pulse) {
+          return;
+        }
+        pendingPulse = pulse;
+        pendingPulseRows.push(pulse);
+        if (pendingPulseRows.length > 64) {
+          pendingPulseRows = pendingPulseRows.slice(-32);
+        }
+        if (!pulseRafId) {
+          if (typeof window.requestAnimationFrame === "function") {
+            pulseRafUsesTimeout = false;
+            pulseRafId = window.requestAnimationFrame(flushPulseFrame);
+          } else {
+            pulseRafUsesTimeout = true;
+            pulseRafId = setTimeout(flushPulseFrame, 0);
+          }
         }
       }
 
@@ -1019,42 +1182,129 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
       var promptErr = document.getElementById("prompt-error");
       var sendBtn = document.getElementById("send-btn");
       var abBtn = document.getElementById("run-ab-btn");
+      var userInvalidDirty = new WeakMap();
+      var supportsUserInvalid = typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("selector(:user-invalid)");
+      var fieldAnnounceTimer = 0;
+      var announcedField = null;
 
-      function validateMaxTokens() {
+      function linkFieldError(el, shown) {
+        var errId = el.getAttribute("data-error");
+        if (!errId) {
+          return;
+        }
+        var raw = el.getAttribute("aria-describedby") || "";
+        var ids = raw.split(/\\s+/).filter(function (id) { return id && id !== errId; });
+        if (shown) {
+          ids.push(errId);
+        }
+        if (ids.length > 0) {
+          el.setAttribute("aria-describedby", ids.join(" "));
+        } else {
+          el.removeAttribute("aria-describedby");
+        }
+      }
+
+      function scheduleFieldAnnouncement(el) {
+        var errId = el.getAttribute("data-error");
+        var errEl = errId ? document.getElementById(errId) : null;
+        if (!errEl || !errEl.textContent.trim()) {
+          return;
+        }
+        clearTimeout(fieldAnnounceTimer);
+        announcedField = el;
+        var msg = errEl.textContent.trim();
+        fieldAnnounceTimer = setTimeout(function () {
+          announcePolite(msg);
+        }, 500);
+      }
+
+      function syncFieldAria(el, valid, shouldAnnounce) {
+        el.setAttribute("aria-invalid", valid ? "false" : "true");
+        linkFieldError(el, !valid);
+        var track = userInvalidDirty.get(el) || { hasInteracted: false, hasBlurred: false };
+        var showFallback = !supportsUserInvalid && (track.hasInteracted && track.hasBlurred);
+        el.classList.toggle("user-invalid-fallback", showFallback && !valid);
+        el.classList.toggle("user-valid-fallback", showFallback && valid);
+        if (valid && announcedField === el) {
+          clearTimeout(fieldAnnounceTimer);
+          announcedField = null;
+        } else if (!valid && shouldAnnounce) {
+          scheduleFieldAnnouncement(el);
+        }
+      }
+
+      function validateMaxTokens(shouldAnnounce) {
         var raw = maxTokensInput.value.trim();
         var num = Number(raw);
         if (!raw || !/^[0-9]+$/.test(raw) || num < 1 || num > 4096) {
           maxTokensInput.setCustomValidity("Enter an integer between 1 and 4096.");
           maxTokensErr.textContent = "Enter 1 to 4096.";
+          syncFieldAria(maxTokensInput, false, Boolean(shouldAnnounce));
           return false;
         }
         maxTokensInput.setCustomValidity("");
         maxTokensErr.textContent = "";
+        syncFieldAria(maxTokensInput, true, false);
         return true;
       }
 
-      function validatePrompt() {
+      function validatePrompt(shouldAnnounce) {
         if (!promptInput.value.trim()) {
           promptInput.setCustomValidity("Prompt cannot be empty.");
           promptErr.textContent = "Prompt cannot be empty.";
+          syncFieldAria(promptInput, false, Boolean(shouldAnnounce));
           return false;
         }
         promptInput.setCustomValidity("");
         promptErr.textContent = "";
+        syncFieldAria(promptInput, true, false);
         return true;
       }
 
-      maxTokensInput.addEventListener("blur", validateMaxTokens);
+      maxTokensInput.addEventListener("blur", function () {
+        var stTrack = userInvalidDirty.get(maxTokensInput) || { hasInteracted: false, hasBlurred: false };
+        stTrack.hasInteracted = true;
+        stTrack.hasBlurred = true;
+        userInvalidDirty.set(maxTokensInput, stTrack);
+        validateMaxTokens(true);
+      });
       maxTokensInput.addEventListener("input", function () {
-        if (/^[0-9]+$/.test(maxTokensInput.value.trim())) {
-          validateMaxTokens();
+        var stTrack = userInvalidDirty.get(maxTokensInput) || { hasInteracted: false, hasBlurred: false };
+        stTrack.hasInteracted = true;
+        userInvalidDirty.set(maxTokensInput, stTrack);
+        if (stTrack.hasBlurred || /^[0-9]+$/.test(maxTokensInput.value.trim())) {
+          validateMaxTokens(false);
         }
       });
-      promptInput.addEventListener("blur", validatePrompt);
+      maxTokensInput.addEventListener("change", function () {
+        var stTrack = userInvalidDirty.get(maxTokensInput) || { hasInteracted: false, hasBlurred: false };
+        stTrack.hasInteracted = true;
+        stTrack.hasBlurred = true;
+        userInvalidDirty.set(maxTokensInput, stTrack);
+        validateMaxTokens(true);
+      });
+
+      promptInput.addEventListener("blur", function () {
+        var stTrack = userInvalidDirty.get(promptInput) || { hasInteracted: false, hasBlurred: false };
+        stTrack.hasInteracted = true;
+        stTrack.hasBlurred = true;
+        userInvalidDirty.set(promptInput, stTrack);
+        validatePrompt(true);
+      });
       promptInput.addEventListener("input", function () {
-        if (promptInput.value.trim()) {
-          validatePrompt();
+        var stTrack = userInvalidDirty.get(promptInput) || { hasInteracted: false, hasBlurred: false };
+        stTrack.hasInteracted = true;
+        userInvalidDirty.set(promptInput, stTrack);
+        if (stTrack.hasBlurred || promptInput.value.trim()) {
+          validatePrompt(false);
         }
+      });
+      promptInput.addEventListener("change", function () {
+        var stTrack = userInvalidDirty.get(promptInput) || { hasInteracted: false, hasBlurred: false };
+        stTrack.hasInteracted = true;
+        stTrack.hasBlurred = true;
+        userInvalidDirty.set(promptInput, stTrack);
+        validatePrompt(true);
       });
 
       var isBusy = false;
@@ -1088,37 +1338,44 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         var finalTelemetry = null;
         var fullText = "";
 
-        while (true) {
-          var part = await reader.read();
-          if (part.done) {
-            break;
+        try {
+          while (true) {
+            var part = await reader.read();
+            if (part.done) {
+              break;
+            }
+            buffer += decoder.decode(part.value, { stream: true });
+            var lines = buffer.split("\\n");
+            buffer = lines.pop() || "";
+            for (var i = 0; i < lines.length; i++) {
+              var line = lines[i].trim();
+              if (!line.startsWith("data:")) {
+                continue;
+              }
+              var payloadStr = line.slice(5).trim();
+              if (payloadStr === "[DONE]") {
+                continue;
+              }
+              var evt = JSON.parse(payloadStr);
+              if (evt.error) {
+                throw new Error((evt.error && evt.error.message) || "Streaming engine error");
+              }
+              var delta = evt.choices && evt.choices[0] && evt.choices[0].delta && evt.choices[0].delta.content;
+              if (delta && targetEl) {
+                fullText += delta;
+                targetEl.textContent = fullText;
+              }
+              if (evt.tpuforge_step) {
+                enqueuePulse(evt.tpuforge_step);
+              }
+              if (evt.tpuforge_telemetry) {
+                finalTelemetry = evt.tpuforge_telemetry;
+                applyFinalTelemetry(finalTelemetry);
+              }
+            }
           }
-          buffer += decoder.decode(part.value, { stream: true });
-          var lines = buffer.split("\\n");
-          buffer = lines.pop() || "";
-          for (var i = 0; i < lines.length; i++) {
-            var line = lines[i].trim();
-            if (!line.startsWith("data:")) {
-              continue;
-            }
-            var payloadStr = line.slice(5).trim();
-            if (payloadStr === "[DONE]") {
-              continue;
-            }
-            var evt = JSON.parse(payloadStr);
-            var delta = evt.choices && evt.choices[0] && evt.choices[0].delta && evt.choices[0].delta.content;
-            if (delta && targetEl) {
-              fullText += delta;
-              targetEl.textContent = fullText;
-            }
-            if (evt.tpuforge_step) {
-              renderPulse(evt.tpuforge_step);
-            }
-            if (evt.tpuforge_telemetry) {
-              finalTelemetry = evt.tpuforge_telemetry;
-              applyFinalTelemetry(finalTelemetry);
-            }
-          }
+        } finally {
+          flushPulseFrame();
         }
         return { text: fullText, telemetry: finalTelemetry };
       }
@@ -1128,8 +1385,10 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         if (isBusy) {
           return;
         }
-        var okTokens = validateMaxTokens();
-        var okPrompt = validatePrompt();
+        userInvalidDirty.set(maxTokensInput, { hasInteracted: true, hasBlurred: true });
+        userInvalidDirty.set(promptInput, { hasInteracted: true, hasBlurred: true });
+        var okTokens = validateMaxTokens(false);
+        var okPrompt = validatePrompt(false);
         if (!okTokens) {
           maxTokensInput.focus();
           return;
@@ -1144,6 +1403,7 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         var text = promptInput.value.trim();
         appendMessage("User (" + mode + ")", text);
         var assistantBody = appendMessage("Model (" + mode + ")", "");
+        resetPulseQueue();
         document.getElementById("pulse-tbody").textContent = "";
 
         setBusy(true);
@@ -1177,8 +1437,10 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         if (isBusy) {
           return;
         }
-        var okTokens = validateMaxTokens();
-        var okPrompt = validatePrompt();
+        userInvalidDirty.set(maxTokensInput, { hasInteracted: true, hasBlurred: true });
+        userInvalidDirty.set(promptInput, { hasInteracted: true, hasBlurred: true });
+        var okTokens = validateMaxTokens(false);
+        var okPrompt = validatePrompt(false);
         if (!okTokens || !okPrompt) {
           (!okTokens ? maxTokensInput : promptInput).focus();
           return;
@@ -1196,11 +1458,14 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         setBusy(true);
         announcePolite("Running A/B benchmark between Static Arena and TPUForge Speculative mode.");
         try {
+          resetPulseQueue();
+          document.getElementById("pulse-tbody").textContent = "";
           var staticBody = appendMessage("A/B Static Arena", "");
           var aRes = await streamCompletion(promptText, maxToks, "static_arena", staticBody);
           var aTps = Number((aRes.telemetry && aRes.telemetry.decode_tok_per_s) || 0);
           document.getElementById("ab-static-val").textContent = aTps.toFixed(1) + " tok/s";
 
+          resetPulseQueue();
           document.getElementById("pulse-tbody").textContent = "";
           var fastBody = appendMessage("A/B " + fastMode, "");
           var bRes = await streamCompletion(promptText, maxToks, fastMode, fastBody);
@@ -1245,13 +1510,16 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
       document.getElementById("apply-seed-btn").addEventListener("click", async function () {
         var pathVal = document.getElementById("seed-path-input").value.trim();
         var textVal = document.getElementById("seed-text-input").value.trim();
+        var lines = textVal
+          ? textVal.split(/\\r?\\n/).map(function (s) { return s.trim(); }).filter(Boolean)
+          : [];
         try {
           var res = await fetch("/api/seed", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               ast_seed_path: pathVal || null,
-              seed_texts: textVal ? [textVal] : []
+              seed_texts: lines
             })
           });
           var data = await res.json();
@@ -1266,18 +1534,79 @@ _HUD_HTML_TEMPLATE = """<!doctype html>
         }
       });
 
-      document.getElementById("theme-toggle-btn").addEventListener("click", function () {
-        var current = document.documentElement.getAttribute("data-theme");
-        var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-        var next = current ? (current === "dark" ? "light" : "dark") : (prefersDark ? "light" : "dark");
-        document.documentElement.setAttribute("data-theme", next);
+      var themeBtn = document.getElementById("theme-toggle-btn");
+      var colorSchemeMeta = document.querySelector('meta[name="color-scheme"]');
+
+      function currentSystemScheme() {
+        return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark"
+          : "light";
+      }
+
+      function effectiveTheme() {
+        var attr = document.documentElement.getAttribute("data-theme");
+        if (attr === "dark" || attr === "light") {
+          return attr;
+        }
+        return currentSystemScheme();
+      }
+
+      function syncThemeControl() {
+        var active = effectiveTheme();
+        themeBtn.setAttribute("aria-pressed", active === "dark" ? "true" : "false");
+        themeBtn.textContent = "Theme: " + active;
+      }
+
+      syncThemeControl();
+
+      window.addEventListener("storage", function (event) {
+        if (event.key !== "tpuforge-theme") {
+          return;
+        }
+        var nextVal = event.newValue;
+        if (nextVal === "dark" || nextVal === "light") {
+          document.documentElement.setAttribute("data-theme", nextVal);
+          if (colorSchemeMeta) {
+            colorSchemeMeta.content = nextVal;
+          }
+        } else {
+          document.documentElement.removeAttribute("data-theme");
+          if (colorSchemeMeta) {
+            colorSchemeMeta.content = "light dark";
+          }
+        }
+        syncThemeControl();
+      });
+
+      themeBtn.addEventListener("click", function () {
+        var rendered = effectiveTheme();
+        var next = rendered === "dark" ? "light" : "dark";
+        var osScheme = currentSystemScheme();
         try {
-          if (window.localStorage) {
-            window.localStorage.setItem("tpuforge-theme", next);
+          if (next === osScheme) {
+            if (window.localStorage) {
+              window.localStorage.removeItem("tpuforge-theme");
+            }
+            document.documentElement.removeAttribute("data-theme");
+            if (colorSchemeMeta) {
+              colorSchemeMeta.content = "light dark";
+            }
+          } else {
+            if (window.localStorage) {
+              window.localStorage.setItem("tpuforge-theme", next);
+            }
+            document.documentElement.setAttribute("data-theme", next);
+            if (colorSchemeMeta) {
+              colorSchemeMeta.content = next;
+            }
           }
         } catch (_err) {
-          /* Ignore storage errors inside restricted iframes. */
+          document.documentElement.setAttribute("data-theme", next);
+          if (colorSchemeMeta) {
+            colorSchemeMeta.content = next;
+          }
         }
+        syncThemeControl();
       });
     })();
   </script>

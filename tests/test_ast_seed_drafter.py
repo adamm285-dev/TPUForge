@@ -287,3 +287,79 @@ def test_block_top_k_hybrid_fallback_with_one_token_cold_prompt_and_ast_seeds() 
     assert max(n.depth for n in tree_fb.nodes()) >= 7
     fb_tokens = {n.token_id for n in tree_fb.nodes()}
     assert {105, 106, 107}.issubset(fb_tokens)
+
+
+def test_ast_seeder_hardening_ancestor_build_size_cap_syntax_fallback_and_cpp_multiline(
+    tmp_path,
+) -> None:
+    from benchmarks.ast_seed_jax import (
+        extract_cpp_ast_snippets,
+        extract_python_ast_snippets,
+        extract_repo_ast_snippets,
+    )
+
+    repo_root = tmp_path / "build" / "nested_repo"
+    repo_root.mkdir(parents=True)
+    (repo_root / "keep.py").write_text(
+        "def valid_nested_kernel(x: int) -> int:\n    return x + 1\n",
+        encoding="utf-8",
+    )
+    (repo_root / "extra.pyi").write_text(
+        "def typed_stub_kernel(x: int) -> int: ...\n",
+        encoding="utf-8",
+    )
+    pruned_dir = repo_root / "build"
+    pruned_dir.mkdir()
+    (pruned_dir / "ignored.py").write_text(
+        "def should_be_pruned() -> int:\n    return 0\n",
+        encoding="utf-8",
+    )
+    (repo_root / "huge.py").write_text(
+        "def huge_skipped_fn() -> int:\n    return 1\n# " + ("x" * (520 * 1024)) + "\n",
+        encoding="utf-8",
+    )
+
+    repo_snippets = extract_repo_ast_snippets(repo_root, include_default_idioms=False)
+    joined_repo = "\n".join(repo_snippets)
+    assert "valid_nested_kernel" in joined_repo
+    assert "typed_stub_kernel" in joined_repo
+    assert "should_be_pruned" not in joined_repo
+    assert "huge_skipped_fn" not in joined_repo
+
+    syntax_err_src = (
+        "def real_before_syntax_error(a: int) -> int:\n"
+        "    return a + 1\n\n"
+        'DOC = """\n'
+        "def fake_inside_string():\n"
+        "    pass\n"
+        '"""\n\n'
+        "def broken_header(:\n"
+    )
+    py_snippets = extract_python_ast_snippets(syntax_err_src)
+    joined_py = "\n".join(py_snippets)
+    assert "real_before_syntax_error" in joined_py
+    assert "fake_inside_string" not in joined_py
+
+    cpp_src = (
+        "template <typename T>\n"
+        "int32_t multi_line_decl(\n"
+        "    const T& input,\n"
+        "    int32_t tile_size\n"
+        ");\n"
+    )
+    cpp_snippets = extract_cpp_ast_snippets(cpp_src)
+    joined_cpp = "\n".join(cpp_snippets)
+    assert "multi_line_decl" in joined_cpp
+    assert "tile_size" in joined_cpp
+
+    assert extract_repo_ast_snippets(repo_root, include_default_idioms=False, max_files=0) == []
+    assert extract_repo_ast_snippets(repo_root, include_default_idioms=False, max_snippets=0) == []
+    capped = extract_repo_ast_snippets(repo_root, include_default_idioms=True, max_snippets=2)
+    assert len(capped) <= 2
+    capped_no_idioms = extract_repo_ast_snippets(
+        repo_root,
+        include_default_idioms=False,
+        max_snippets=2,
+    )
+    assert len(capped_no_idioms) == 2
+

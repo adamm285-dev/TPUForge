@@ -15,7 +15,13 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
 from benchmarks.hud_ui import render_hud_html
+from benchmarks.qwen_jax import (
+    _is_complete_safetensors_dir,
+    discover_local_models,
+    resolve_model_dir,
+)
 from benchmarks.tpuforge_serve import (
+    ForgeServeHTTPServer,
     load_serve_session,
     main,
     resolve_preset_spec,
@@ -25,6 +31,7 @@ from tests.test_block_tree_and_suffix import _build_qwen3_and_block_drafter_dirs
 from tests.test_gemma4 import (
     _create_synthetic_gemma4_dflash_dir,
     _create_synthetic_gemma4_dir,
+    _write_safetensors,
 )
 
 
@@ -123,6 +130,13 @@ def test_hud_html_modern_web_compliance() -> None:
             'inputmode="numeric"',
             'aria-live="polite"',
             'aria-live="assertive"',
+            "requestAnimationFrame",
+            "tabular-nums",
+            "container-type: inline-size",
+            'role="region"',
+            "aria-pressed",
+            "user-invalid-fallback",
+            "evt.error",
         ):
             assert required in html
 
@@ -412,3 +426,185 @@ def test_qwen_and_moe_mmap_serve_session_parity(tmp_path: Path) -> None:
         assert len(q_bt.token_ids) == 8
     finally:
         qwen_session.close()
+
+
+def test_model_discovery_shard_validation_and_local_only_guard(tmp_path: Path) -> None:
+    import numpy as np
+    import pytest
+
+    models_root = tmp_path / "models"
+    incomplete_dir = models_root / "qwen3-incomplete"
+    incomplete_dir.mkdir(parents=True)
+    (incomplete_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+    shard_index = {
+        "metadata": {"total_size": 32},
+        "weight_map": {
+            "a.weight": "model-00001-of-00002.safetensors",
+            "b.weight": "model-00002-of-00002.safetensors",
+        },
+    }
+    (incomplete_dir / "model.safetensors.index.json").write_text(
+        json.dumps(shard_index),
+        encoding="utf-8",
+    )
+    _write_safetensors(
+        incomplete_dir / "model-00001-of-00002.safetensors",
+        {"a.weight": np.zeros((2, 2), dtype=np.float32)},
+    )
+    assert _is_complete_safetensors_dir(incomplete_dir) is False
+
+    complete_dir = models_root / "gemma4-sharded"
+    complete_dir.mkdir(parents=True)
+    (complete_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma4",
+                "architectures": ["Gemma4ForCausalLM"],
+                "hidden_size": 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (complete_dir / "model.safetensors.index.json").write_text(
+        json.dumps(shard_index),
+        encoding="utf-8",
+    )
+    _write_safetensors(
+        complete_dir / "model-00001-of-00002.safetensors",
+        {"a.weight": np.zeros((2, 2), dtype=np.float32)},
+    )
+    _write_safetensors(
+        complete_dir / "model-00002-of-00002.safetensors",
+        {"b.weight": np.zeros((2, 2), dtype=np.float32)},
+    )
+    assert _is_complete_safetensors_dir(complete_dir) is True
+
+    discovered = discover_local_models(search_roots=[models_root])
+    discovered_paths = {Path(str(entry["local_dir"])).resolve() for entry in discovered}
+    assert complete_dir.resolve() in discovered_paths
+    assert incomplete_dir.resolve() not in discovered_paths
+
+    with pytest.raises(FileNotFoundError):
+        resolve_model_dir(
+            "nonexistent/local-only-model",
+            search_roots=[models_root],
+            allow_download=False,
+        )
+    assert (
+        resolve_model_dir(
+            str(complete_dir),
+            search_roots=[models_root],
+            allow_download=False,
+        ).resolve()
+        == complete_dir.resolve()
+    )
+
+
+def test_exclusive_port_binding_cli_flags_and_strict_http_validation(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    import http.client
+
+    import pytest
+
+    ckpt_dir, _ = _create_synthetic_gemma4_dir(
+        tmp_path / "gemma4_cli_serve",
+        seed=7,
+        enable_moe=False,
+        num_layers=6,
+        hidden_size=32,
+        intermediate_size=64,
+        vocab_size=320,
+    )
+
+    assert main(["--list-local"]) == 0
+    _ = capsys.readouterr()
+
+    assert main([str(ckpt_dir), "--dry-run", "--weight-quant", "int8", "--tp-size", "1"]) == 0
+    _ = capsys.readouterr()
+
+    for bad_argv in (
+        [str(ckpt_dir), "--port", "70000", "--dry-run"],
+        [str(ckpt_dir), "--local-only", "--allow-download", "--dry-run"],
+    ):
+        with pytest.raises((SystemExit, ValueError)):
+            rc = main(bad_argv)
+            if rc != 0:
+                raise SystemExit(rc)
+
+    with pytest.raises(TypeError):
+        resolve_preset_spec("custom", tp_size=True)
+    with pytest.raises(TypeError):
+        resolve_preset_spec("custom", max_seq_len=True)
+
+    session = load_serve_session(
+        str(ckpt_dir),
+        max_seq_len=256,
+        dtype="float32",
+        tile_size=128,
+        tp_size=1,
+        weight_quant="int8",
+        enable_xla_cache=False,
+        warmup=False,
+    )
+    server, _thread, _url = start_serve_background(session, host="127.0.0.1", port=0)
+    try:
+        assert server.bound_port > 0
+        with pytest.raises(OSError):
+            dup = ForgeServeHTTPServer(("127.0.0.1", server.bound_port), session)
+            dup.server_close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.bound_port, timeout=10)
+        try:
+            conn.request("GET", "/api/local-models")
+            local_resp = conn.getresponse()
+            local_body = json.loads(local_resp.read().decode("utf-8"))
+            assert local_resp.status == 200
+            assert isinstance(local_body, dict)
+            assert isinstance(local_body.get("models"), list)
+
+            missing_repo_payload = json.dumps({"repo_path": str(tmp_path / "missing_repo_path")}).encode("utf-8")
+            conn.request(
+                "POST",
+                "/api/seed",
+                body=missing_repo_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            seed_resp = conn.getresponse()
+            seed_body = json.loads(seed_resp.read().decode("utf-8"))
+            assert seed_resp.status == 404
+            assert "error" in seed_body
+
+            for bad_chat in (
+                {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": True},
+                {"prompt_tokens": [], "stream": True, "max_tokens": 8},
+            ):
+                conn.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=json.dumps(bad_chat).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                chat_resp = conn.getresponse()
+                chat_raw = chat_resp.read().decode("utf-8")
+                chat_ct = chat_resp.getheader("Content-Type", "")
+                assert chat_resp.status == 400
+                assert "application/json" in chat_ct
+                chat_err = json.loads(chat_raw)
+                assert "error" in chat_err
+        finally:
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        session.close()

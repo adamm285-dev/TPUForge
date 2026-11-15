@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import socket
 import sys
 import threading
 import time
@@ -44,12 +46,62 @@ from benchmarks.hud_ui import render_hud_html
 from benchmarks.qwen_jax import (
     _MASK_BLOCK_VAL,
     QwenBenchmarkRunner,
+    default_local_model_roots,
+    discover_local_models,
     encode_chat_messages,
     load_qwen_runner,
     resolve_model_dir,
 )
 
 VALID_SERVE_MODES: tuple[str, ...] = ("block_tree", "tree", "static_arena")
+VALID_WEIGHT_QUANTS: tuple[str, ...] = ("none", "int8", "fp8")
+VALID_DTYPES: tuple[str, ...] = ("auto", "float32", "bfloat16", "float16")
+VALID_HOST_STORES: tuple[str, ...] = ("auto", "hbm", "mmap", "dram")
+_CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError)
+
+
+def _parse_strict_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a boolean")
+    return value
+
+
+def _parse_strict_int(
+    value: Any,
+    name: str,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value}")
+    return int(value)
+
+
+def _parse_strict_float(
+    value: Any,
+    name: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    exclusive_minimum: float | None = None,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number")
+    val = float(value)
+    if not math.isfinite(val):
+        raise ValueError(f"{name} must be finite")
+    if exclusive_minimum is not None and val <= exclusive_minimum:
+        raise ValueError(f"{name} must be > {exclusive_minimum}, got {val}")
+    if minimum is not None and val < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {val}")
+    if maximum is not None and val > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {val}")
+    return val
 
 
 @dataclass(frozen=True)
@@ -203,11 +255,24 @@ def detect_tpu_hardware(
     """Inspect active JAX runtime devices (with optional explicit overrides for planning/tests)."""
     devs = jax.devices()
     backend = jax.default_backend()
-    eff_chips = int(chip_count) if chip_count is not None else len(devs)
-    eff_kind = device_kind if device_kind is not None else str(getattr(devs[0], "device_kind", backend))
+    if chip_count is not None:
+        eff_chips = _parse_strict_int(chip_count, "chip_count", minimum=1)
+    else:
+        eff_chips = max(1, len(devs))
 
-    eff_hbm = hbm_per_chip_gib
-    if eff_hbm is None:
+    if device_kind is not None:
+        if not isinstance(device_kind, str) or not device_kind.strip():
+            raise ValueError("device_kind must be a non-empty string")
+        eff_kind = device_kind.strip()
+    else:
+        eff_kind = str(getattr(devs[0], "device_kind", backend))
+
+    if hbm_per_chip_gib is not None:
+        eff_hbm: float | None = _parse_strict_float(
+            hbm_per_chip_gib, "hbm_per_chip_gib", exclusive_minimum=0.0
+        )
+    else:
+        eff_hbm = None
         try:
             mem_stats = devs[0].memory_stats()
             if isinstance(mem_stats, dict) and mem_stats.get("bytes_limit"):
@@ -245,47 +310,93 @@ def resolve_preset_spec(
     device_kind: str | None = None,
 ) -> ResolvedPresetSpec:
     """Resolve an Ollama-style preset name or HF/local checkpoint path against TPU hardware."""
+    if not isinstance(preset_or_model, str):
+        raise TypeError("preset_or_model must be a string")
+    raw_target = preset_or_model.strip()
+    if not raw_target:
+        raise ValueError("preset_or_model cannot be empty")
+    if draft_model is not None and not isinstance(draft_model, str):
+        raise TypeError("draft_model must be a string or None")
+
     hw = detect_tpu_hardware(
         chip_count=chip_count,
         hbm_per_chip_gib=hbm_per_chip_gib,
         device_kind=device_kind,
     )
-    entry = PRESET_CATALOG.get(preset_or_model.strip().lower())
+
+    if isinstance(tile_size, str):
+        cleaned_tile = tile_size.strip().lower()
+        if cleaned_tile == "auto":
+            eff_tile = hw.tile_size
+        elif cleaned_tile.isdigit():
+            eff_tile = int(cleaned_tile)
+        else:
+            raise ValueError(f"Unsupported tile_size={tile_size!r}; expected 'auto', 128, or 256")
+    else:
+        eff_tile = _parse_strict_int(tile_size, "tile_size")
+    if eff_tile not in (128, 256):
+        raise ValueError(f"tile_size must be 128 or 256, got {eff_tile}")
+
+    entry = PRESET_CATALOG.get(raw_target.lower())
     if entry is not None:
         preset_name = entry.name
         model_id = entry.model_id
-        eff_draft = entry.draft_model_id if draft_model is None else (draft_model or None)
+        eff_draft = entry.draft_model_id if draft_model is None else (draft_model.strip() or None)
         eff_quant = entry.weight_quant if weight_quant is None else weight_quant
         eff_dtype = entry.dtype if dtype is None else dtype
         eff_store = entry.host_store if host_store is None else host_store
-        eff_max_seq = entry.default_max_seq_len if max_seq_len is None else int(max_seq_len)
+        default_max_seq = entry.default_max_seq_len
         min_hbm = entry.min_hbm_gib
     else:
-        preset_name = Path(preset_or_model).name or preset_or_model
-        model_id = preset_or_model
-        eff_draft = draft_model or None
+        preset_name = Path(raw_target).name or raw_target
+        model_id = raw_target
+        eff_draft = draft_model.strip() if draft_model else None
         eff_quant = "none" if weight_quant is None else weight_quant
         eff_dtype = "auto" if dtype is None else dtype
         eff_store = "hbm" if host_store is None else host_store
-        eff_max_seq = 1024 if max_seq_len is None else int(max_seq_len)
+        default_max_seq = 1024
         min_hbm = 0.0
 
-    # Resolve tile_size cleanly against hardware unless explicitly pinned.
-    if isinstance(tile_size, str) and tile_size.strip().lower() == "auto":
-        eff_tile = hw.tile_size
-    else:
-        eff_tile = int(tile_size)
+    if not isinstance(eff_quant, str) or eff_quant.strip().lower() not in VALID_WEIGHT_QUANTS:
+        raise ValueError(f"weight_quant must be one of {VALID_WEIGHT_QUANTS}, got {eff_quant!r}")
+    eff_quant = eff_quant.strip().lower()
 
-    # Resolve TP degree cleanly for planning without requiring TPU devices at CLI inspect time.
-    if isinstance(tp_size, str) and tp_size.strip().lower() == "auto":
-        if entry is not None and entry.name == "gemma4:12b" and hw.hbm_per_chip_gib is not None and hw.hbm_per_chip_gib >= 14.5:
-            eff_tp = 1
-        elif hw.device_kind.lower().startswith("tpu") or hw.chip_count > 1:
-            eff_tp = hw.chip_count
+    if not isinstance(eff_dtype, str) or eff_dtype.strip().lower() not in VALID_DTYPES:
+        raise ValueError(f"dtype must be one of {VALID_DTYPES}, got {eff_dtype!r}")
+    eff_dtype = eff_dtype.strip().lower()
+
+    if not isinstance(eff_store, str) or eff_store.strip().lower() not in VALID_HOST_STORES:
+        raise ValueError(f"host_store must be one of {VALID_HOST_STORES}, got {eff_store!r}")
+    eff_store = eff_store.strip().lower()
+
+    eff_max_seq = (
+        default_max_seq
+        if max_seq_len is None
+        else _parse_strict_int(max_seq_len, "max_seq_len", minimum=eff_tile + 2)
+    )
+    eff_top_k = _parse_strict_int(top_k, "top_k", minimum=1)
+    eff_stage_experts = _parse_strict_int(stage_experts, "stage_experts", minimum=1)
+
+    if isinstance(tp_size, str):
+        cleaned_tp = tp_size.strip().lower()
+        if cleaned_tp == "auto":
+            if (
+                entry is not None
+                and entry.name == "gemma4:12b"
+                and hw.hbm_per_chip_gib is not None
+                and hw.hbm_per_chip_gib >= 14.5
+            ):
+                eff_tp = 1
+            elif hw.device_kind.lower().startswith("tpu") or hw.chip_count > 1:
+                eff_tp = hw.chip_count
+            else:
+                eff_tp = 1
+        elif cleaned_tp.isdigit():
+            eff_tp = _parse_strict_int(int(cleaned_tp), "tp_size", minimum=1)
         else:
-            eff_tp = 1
+            raise ValueError(f"tp_size must be 'auto' or a positive integer, got {tp_size!r}")
     else:
-        eff_tp = int(tp_size)
+        eff_tp = _parse_strict_int(tp_size, "tp_size", minimum=1)
 
     # Automatic single-chip HBM overflow fallback (e.g. gemma4:26b on 15.75 GiB v5e-1 -> host mmap).
     if eff_store == "auto":
@@ -308,8 +419,8 @@ def resolve_preset_spec(
         tile_size=eff_tile,
         tp_size=eff_tp,
         max_seq_len=eff_max_seq,
-        top_k=int(top_k),
-        stage_experts=int(stage_experts),
+        top_k=eff_top_k,
+        stage_experts=eff_stage_experts,
         hardware=hw,
     )
 
@@ -334,6 +445,30 @@ def format_preset_catalog_table(hw: HardwareProfile | None = None) -> str:
         lines.append(
             f"{name:<18} {plan.weight_quant:<6} {plan.host_store:<6} {plan.tile_size:<5} "
             f"{draft_label:<32} {entry.description}"
+        )
+    return "\n".join(lines)
+
+
+def format_local_models_table(search_roots: Sequence[str | Path] | None = None) -> str:
+    """Format discovered complete local safetensors checkpoints and search roots for CLI display."""
+    roots = (
+        [Path(r).expanduser() for r in search_roots]
+        if search_roots is not None
+        else default_local_model_roots()
+    )
+    models = discover_local_models(roots)
+    lines = [
+        "Search Roots: " + (", ".join(str(r) for r in roots) if roots else "(none detected)"),
+        "",
+    ]
+    if not models:
+        lines.append("No complete local safetensors checkpoints found.")
+        return "\n".join(lines)
+    lines.append(f"{'Repo / Name':<38} {'Arch':<10} {'Source':<10} Path")
+    lines.append("-" * 100)
+    for item in models:
+        lines.append(
+            f"{item['repo_id']:<38} {item['arch']:<10} {item['source']:<10} {item['local_dir']}"
         )
     return "\n".join(lines)
 
@@ -377,6 +512,7 @@ class ForgeServeSession:
         model_dir: Path,
         draft_dir: Path | None = None,
         ast_seed_path: str | Path | None = None,
+        search_roots: Sequence[str | Path] | None = None,
         warmup: bool = True,
     ) -> None:
         self.spec = spec
@@ -394,6 +530,10 @@ class ForgeServeSession:
         self.base_seed_sequences: list[list[int]] = []
         self.ast_seed_source: str = ""
         self._warmed_modes: set[str] = set()
+        self._search_roots: tuple[Path, ...] | None = (
+            tuple(Path(r) for r in search_roots) if search_roots is not None else None
+        )
+        self._local_models_cache: list[dict[str, Any]] = discover_local_models(self._search_roots)
 
         if ast_seed_path is not None:
             self.update_ast_seed(ast_seed_path=ast_seed_path, append=False)
@@ -402,6 +542,13 @@ class ForgeServeSession:
 
         if warmup:
             self.warmup()
+
+    def refresh_local_models(self) -> list[dict[str, Any]]:
+        """Scan configured local model roots outside the inference lock and update cached inventory."""
+        discovered = discover_local_models(self._search_roots)
+        with self._lock:
+            self._local_models_cache = discovered
+            return list(self._local_models_cache)
 
     @property
     def default_mode(self) -> str:
@@ -435,6 +582,8 @@ class ForgeServeSession:
             close_fn()
 
     def status_dict(self) -> dict[str, Any]:
+        seed_snapshot = list(self.base_seed_sequences)
+        local_models_snapshot = list(self._local_models_cache)
         return {
             "preset": self.spec.preset_name,
             "model_id": self.spec.model_id,
@@ -451,9 +600,10 @@ class ForgeServeSession:
             "max_seq_len": self.max_seq_len,
             "hardware_label": self.spec.hardware.label,
             "total_compiles": self.total_compile_count(),
-            "ast_seed_sequences": len(self.base_seed_sequences),
-            "ast_seed_tokens": sum(len(seq) for seq in self.base_seed_sequences),
+            "ast_seed_sequences": len(seed_snapshot),
+            "ast_seed_tokens": sum(len(seq) for seq in seed_snapshot),
             "ast_seed_source": self.ast_seed_source,
+            "local_models_count": len(local_models_snapshot),
             "available_presets": list(PRESET_CATALOG.keys()),
         }
 
@@ -461,23 +611,51 @@ class ForgeServeSession:
         self,
         *,
         ast_seed_path: str | Path | None = None,
+        repo_path: str | Path | None = None,
         seed_texts: Sequence[str] | None = None,
+        snippets: Sequence[str] | None = None,
         append: bool = False,
+        reset: bool | None = None,
     ) -> dict[str, Any]:
-        snippets: list[str] = []
-        if ast_seed_path is not None and str(ast_seed_path).strip():
-            snippets.extend(extract_repo_ast_snippets([Path(ast_seed_path)]))
-            self.ast_seed_source = str(ast_seed_path)
-        if seed_texts:
-            for txt in seed_texts:
-                if isinstance(txt, str) and txt.strip():
-                    snippets.append(txt.strip())
-        if not snippets and not append:
-            snippets = list(DEFAULT_CODE_IDIOMS)
+        eff_append = _parse_strict_bool(append, "append")
+        if reset is not None:
+            eff_append = not _parse_strict_bool(reset, "reset")
 
-        new_seqs = encode_with_tokenizer(snippets, self.tokenizer)
+        collected: list[str] = []
+        new_source: str | None = None
+        eff_path = ast_seed_path if ast_seed_path is not None else repo_path
+        if eff_path is not None:
+            if not isinstance(eff_path, (str, Path)):
+                raise TypeError("ast_seed_path / repo_path must be a string or Path")
+            raw_path = str(eff_path).strip()
+            if raw_path:
+                target_path = Path(raw_path).expanduser()
+                if not target_path.exists():
+                    raise FileNotFoundError(f"AST seed path does not exist: {target_path}")
+                collected.extend(extract_repo_ast_snippets(target_path))
+                new_source = str(target_path)
+
+        eff_texts = seed_texts if seed_texts is not None else snippets
+        if eff_texts is not None:
+            if isinstance(eff_texts, (str, bytes)) or not isinstance(eff_texts, Sequence):
+                raise TypeError("seed_texts / snippets must be a list of strings")
+            for idx, txt in enumerate(eff_texts):
+                if not isinstance(txt, str):
+                    raise TypeError(f"seed_texts[{idx}] must be a string")
+                stripped = txt.strip()
+                if stripped:
+                    collected.append(stripped)
+
+        if not collected and not eff_append:
+            collected = list(DEFAULT_CODE_IDIOMS)
+
+        new_seqs = encode_with_tokenizer(collected, self.tokenizer)
         with self._lock:
-            if append:
+            if new_source is not None:
+                self.ast_seed_source = new_source
+            elif not eff_append:
+                self.ast_seed_source = ""
+            if eff_append:
                 self.base_seed_sequences.extend(new_seqs)
             else:
                 self.base_seed_sequences = new_seqs
@@ -489,17 +667,46 @@ class ForgeServeSession:
         *,
         enable_thinking: bool = False,
     ) -> list[int]:
+        if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
+            raise TypeError("messages must be a non-empty sequence of message objects")
         if not messages:
             raise ValueError("messages cannot be empty")
-        norm = [
-            {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
-            for m in messages
-        ]
+        norm: list[dict[str, str]] = []
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                raise TypeError(f"messages[{idx}] must be an object")
+            role = msg.get("role")
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError(f"messages[{idx}].role must be a non-empty string")
+            raw_content = msg.get("content", "")
+            if isinstance(raw_content, str):
+                text_content = raw_content
+            elif isinstance(raw_content, Sequence) and not isinstance(raw_content, (bytes, bytearray)):
+                parts: list[str] = []
+                for part in raw_content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        txt = part.get("text")
+                        if not isinstance(txt, str):
+                            raise TypeError(f"messages[{idx}] text part requires string 'text'")
+                        parts.append(txt)
+                    else:
+                        raise TypeError(
+                            f"messages[{idx}].content list items must be {{\"type\": \"text\", \"text\": ...}}"
+                        )
+                text_content = "".join(parts)
+            else:
+                raise TypeError(f"messages[{idx}].content must be a string or text-part list")
+            norm.append({"role": role.strip(), "content": text_content})
+
         if self.is_gemma4:
-            return encode_gemma4_chat_messages(
+            token_ids = encode_gemma4_chat_messages(
                 self.tokenizer, norm, enable_thinking=enable_thinking
             )
-        return encode_chat_messages(self.tokenizer, norm, enable_thinking=enable_thinking)
+        else:
+            token_ids = encode_chat_messages(self.tokenizer, norm, enable_thinking=enable_thinking)
+        if not token_ids:
+            raise ValueError("Encoded messages produced zero prompt tokens")
+        return token_ids
 
     def _run_prefill_static(
         self,
@@ -1076,6 +1283,8 @@ def load_serve_session(
     top_k: int = 8,
     ast_seed_path: str | Path | None = None,
     enable_xla_cache: bool = True,
+    allow_download: bool = True,
+    search_roots: Sequence[str | Path] | None = None,
     warmup: bool = True,
 ) -> ForgeServeSession:
     """Resolve preset or local/HF model directory and load target + optional DFlash runner."""
@@ -1091,7 +1300,9 @@ def load_serve_session(
         top_k=top_k,
         stage_experts=stage_experts,
     )
-    model_dir = resolve_model_dir(spec.model_id)
+    model_dir = resolve_model_dir(
+        spec.model_id, search_roots=search_roots, allow_download=allow_download
+    )
     gemma4 = is_gemma4_model_dir(model_dir)
     tile_arg: int | str = spec.tile_size if tile_size != "auto" else "auto"
     tp_arg: int | str = spec.tp_size if tp_size != "auto" else "auto"
@@ -1117,13 +1328,17 @@ def load_serve_session(
                 model_dir=model_dir,
                 draft_dir=None,
                 ast_seed_path=ast_seed_path,
+                search_roots=search_roots,
                 warmup=warmup,
             )
 
         if spec.draft_model_id:
+            draft_resolved = resolve_model_dir(
+                spec.draft_model_id, search_roots=search_roots, allow_download=allow_download
+            )
             block_runner, model_dir, draft_dir = load_gemma4_block_tree_runner(
                 str(model_dir),
-                spec.draft_model_id,
+                str(draft_resolved),
                 max_seq_len=spec.max_seq_len,
                 dtype_name=spec.dtype,
                 tile_size=tile_arg,
@@ -1140,6 +1355,7 @@ def load_serve_session(
                 model_dir=model_dir,
                 draft_dir=draft_dir,
                 ast_seed_path=ast_seed_path,
+                search_roots=search_roots,
                 warmup=warmup,
             )
 
@@ -1160,13 +1376,17 @@ def load_serve_session(
             model_dir=model_dir,
             draft_dir=None,
             ast_seed_path=ast_seed_path,
+            search_roots=search_roots,
             warmup=warmup,
         )
 
     if spec.draft_model_id:
+        draft_resolved = resolve_model_dir(
+            spec.draft_model_id, search_roots=search_roots, allow_download=allow_download
+        )
         qwen_block, model_dir, draft_dir = load_qwen_block_tree_runner(
             str(model_dir),
-            spec.draft_model_id,
+            str(draft_resolved),
             max_seq_len=spec.max_seq_len,
             dtype_name=spec.dtype,
             tile_size=tile_arg,
@@ -1184,6 +1404,7 @@ def load_serve_session(
             model_dir=model_dir,
             draft_dir=draft_dir,
             ast_seed_path=ast_seed_path,
+            search_roots=search_roots,
             warmup=warmup,
         )
 
@@ -1204,15 +1425,16 @@ def load_serve_session(
         model_dir=model_dir,
         draft_dir=None,
         ast_seed_path=ast_seed_path,
+        search_roots=search_roots,
         warmup=warmup,
     )
 
 
 class ForgeServeHTTPServer(ThreadingHTTPServer):
-    """Multi-threaded HTTP server holding a single ForgeServeSession."""
+    """Multi-threaded HTTP server holding a single ForgeServeSession with exclusive port binding on Windows."""
 
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = sys.platform != "win32"
 
     def __init__(
         self,
@@ -1221,6 +1443,35 @@ class ForgeServeHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self.session = session
         super().__init__(server_address, _ForgeServeHandler)
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    @property
+    def bound_port(self) -> int:
+        return int(self.server_address[1])
+
+
+def _validate_seed_token_sequences(
+    raw_seqs: Any, vocab_size: int
+) -> list[list[int]] | None:
+    if raw_seqs is None:
+        return None
+    if isinstance(raw_seqs, (str, bytes)) or not isinstance(raw_seqs, Sequence):
+        raise TypeError("seed_token_sequences must be a list of token-ID lists")
+    out: list[list[int]] = []
+    for idx, seq in enumerate(raw_seqs):
+        if isinstance(seq, (str, bytes)) or not isinstance(seq, Sequence):
+            raise TypeError(f"seed_token_sequences[{idx}] must be a list of integers")
+        out.append(
+            [
+                _parse_strict_int(tok, f"seed_token_sequences[{idx}]", minimum=0, maximum=vocab_size - 1)
+                for tok in seq
+            ]
+        )
+    return out
 
 
 class _ForgeServeHandler(BaseHTTPRequestHandler):
@@ -1237,14 +1488,22 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
+    def _send_bytes(self, status: int, content_type: str, payload: bytes) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+        except _CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
+
     def _send_json(self, status: int, payload: Any) -> None:
         raw = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self._send_cors_headers()
-        self.end_headers()
-        self.wfile.write(raw)
+        self._send_bytes(status, "application/json; charset=utf-8", raw)
 
     def _send_error_json(self, status: int, message: str, err_type: str = "invalid_request_error") -> None:
         self._send_json(
@@ -1256,7 +1515,10 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
         length_str = self.headers.get("Content-Length")
         if not length_str:
             raise ValueError("Missing Content-Length header")
-        length = int(length_str)
+        try:
+            length = int(length_str)
+        except ValueError as exc:
+            raise ValueError(f"Invalid Content-Length header: {length_str!r}") from exc
         if length < 0 or length > 8 * 1024 * 1024:
             raise ValueError("Request body size out of bounds")
         body = self.rfile.read(length)
@@ -1265,11 +1527,86 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
             raise TypeError("JSON body must be an object")
         return parsed
 
+    def _prepare_chat_request(
+        self, session: ForgeServeSession, body: dict[str, Any]
+    ) -> tuple[str, list[int], int, bool, str | None, list[list[int]] | None]:
+        raw_model = body.get("model")
+        if raw_model is None:
+            req_model = session.spec.preset_name
+        elif isinstance(raw_model, str) and raw_model.strip():
+            req_model = raw_model.strip()
+        else:
+            raise ValueError("model must be a non-empty string")
+
+        max_tokens = _parse_strict_int(
+            body.get("max_tokens", 128), "max_tokens", minimum=1, maximum=session.max_seq_len
+        )
+        stream = _parse_strict_bool(body.get("stream", False), "stream")
+        enable_thinking = _parse_strict_bool(body.get("enable_thinking", False), "enable_thinking")
+        if body.get("temperature") is not None:
+            _parse_strict_float(body["temperature"], "temperature", minimum=0.0, maximum=2.0)
+
+        mode = body.get("mode")
+        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
+            raise ValueError("mode must be a non-empty string")
+
+        vocab_size = int(session.config.vocab_size)
+        if "prompt_tokens" in body:
+            raw_ptoks = body["prompt_tokens"]
+            if isinstance(raw_ptoks, (str, bytes)) or not isinstance(raw_ptoks, Sequence):
+                raise TypeError("prompt_tokens must be a list of integers")
+            if not raw_ptoks:
+                raise ValueError("prompt_tokens cannot be empty")
+            prompt_tokens = [
+                _parse_strict_int(t, "prompt_tokens[]", minimum=0, maximum=vocab_size - 1)
+                for t in raw_ptoks
+            ]
+        elif "messages" in body:
+            prompt_tokens = session.encode_messages(
+                body["messages"], enable_thinking=enable_thinking
+            )
+        elif "prompt" in body:
+            raw_prompt = body["prompt"]
+            if not isinstance(raw_prompt, str) or not raw_prompt.strip():
+                raise ValueError("prompt must be a non-empty string")
+            prompt_tokens = session.encode_messages(
+                [{"role": "user", "content": raw_prompt}],
+                enable_thinking=enable_thinking,
+            )
+        else:
+            raise ValueError("Request must include 'messages', 'prompt', or 'prompt_tokens'")
+
+        seed_seqs = _validate_seed_token_sequences(body.get("seed_token_sequences"), vocab_size)
+        raw_seed_texts = (
+            body.get("seed_texts") if "seed_texts" in body else body.get("seed_snippets")
+        )
+        if seed_seqs is None and raw_seed_texts is not None:
+            if isinstance(raw_seed_texts, (str, bytes)) or not isinstance(raw_seed_texts, Sequence):
+                raise TypeError("seed_texts must be a list of strings")
+            if len(raw_seed_texts) > 256:
+                raise ValueError("seed_texts cannot exceed 256 entries")
+            for idx, txt in enumerate(raw_seed_texts):
+                if not isinstance(txt, str):
+                    raise TypeError(f"seed_texts[{idx}] must be a string")
+            seed_seqs = encode_with_tokenizer(raw_seed_texts, session.tokenizer)
+
+        return (
+            req_model,
+            prompt_tokens,
+            max_tokens,
+            stream,
+            mode.strip() if isinstance(mode, str) else None,
+            seed_seqs,
+        )
+
     def do_OPTIONS(self) -> None:
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Content-Length", "0")
-        self._send_cors_headers()
-        self.end_headers()
+        try:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Content-Length", "0")
+            self._send_cors_headers()
+            self.end_headers()
+        except _CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
 
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
@@ -1277,12 +1614,7 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
 
         if path == "/" or path == "/index.html":
             html_bytes = render_hud_html(session.status_dict()).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html_bytes)))
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(html_bytes)
+            self._send_bytes(HTTPStatus.OK, "text/html; charset=utf-8", html_bytes)
             return
 
         if path == "/health":
@@ -1292,6 +1624,24 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
 
         if path == "/api/status":
             self._send_json(HTTPStatus.OK, session.status_dict())
+            return
+
+        if path == "/api/local-models":
+            models = session.refresh_local_models()
+            roots = (
+                list(session._search_roots)
+                if session._search_roots is not None
+                else default_local_model_roots()
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "object": "list",
+                    "models": models,
+                    "count": len(models),
+                    "search_roots": [str(r) for r in roots],
+                },
+            )
             return
 
         if path == "/v1/models":
@@ -1331,9 +1681,15 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body()
                 updated = session.update_ast_seed(
                     ast_seed_path=body.get("ast_seed_path"),
+                    repo_path=body.get("repo_path"),
                     seed_texts=body.get("seed_texts"),
-                    append=bool(body.get("append", False)),
+                    snippets=body.get("snippets"),
+                    append=body.get("append", False),
+                    reset=body.get("reset"),
                 )
+            except FileNotFoundError as exc:
+                self._send_error_json(HTTPStatus.NOT_FOUND, str(exc), "not_found_error")
+                return
             except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -1343,34 +1699,19 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
         if path == "/v1/chat/completions":
             try:
                 body = self._read_json_body()
-                req_model = str(body.get("model") or session.spec.preset_name)
-                max_tokens = int(body.get("max_tokens", 128))
-                stream = bool(body.get("stream", False))
-                mode = body.get("mode")
-                enable_thinking = bool(body.get("enable_thinking", False))
-
-                if "prompt_tokens" in body:
-                    prompt_tokens = [int(t) for t in body["prompt_tokens"]]
-                elif "messages" in body:
-                    prompt_tokens = session.encode_messages(
-                        body["messages"], enable_thinking=enable_thinking
-                    )
-                elif "prompt" in body:
-                    prompt_tokens = session.encode_messages(
-                        [{"role": "user", "content": str(body["prompt"])}],
-                        enable_thinking=enable_thinking,
-                    )
-                else:
-                    raise ValueError("Request must include 'messages', 'prompt', or 'prompt_tokens'")
-
-                seed_seqs = body.get("seed_token_sequences")
-                if not seed_seqs and body.get("seed_texts"):
-                    seed_seqs = encode_with_tokenizer(body["seed_texts"], session.tokenizer)
+                (
+                    req_model,
+                    prompt_tokens,
+                    max_tokens,
+                    stream,
+                    mode,
+                    seed_seqs,
+                ) = self._prepare_chat_request(session, body)
 
                 gen_iter = session.stream_generate(
                     prompt_tokens=prompt_tokens,
                     max_tokens=max_tokens,
-                    mode=str(mode) if mode is not None else None,
+                    mode=mode,
                     seed_token_sequences=seed_seqs,
                 )
                 first_or_summary = next(gen_iter)
@@ -1417,12 +1758,17 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, resp)
                 return
 
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self._send_cors_headers()
-            self.end_headers()
+            try:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self._send_cors_headers()
+                self.end_headers()
+            except _CLIENT_DISCONNECT_ERRORS:
+                self.close_connection = True
+                return
 
             def _write_sse(payload: Any) -> None:
                 line = "data: " + (
@@ -1430,6 +1776,47 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
                 ) + "\n\n"
                 self.wfile.write(line.encode("utf-8"))
                 self.wfile.flush()
+
+            def _emit_sse_item(evt: StepPulse | GenerationSummary) -> None:
+                if isinstance(evt, StepPulse):
+                    chunk_payload: dict[str, Any] = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": req_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": ({"content": evt.text_delta} if evt.text_delta else {}),
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    if evt.drafted_nodes > 0 or evt.accepted_rows:
+                        chunk_payload["tpuforge_step"] = asdict(evt)
+                    _write_sse(chunk_payload)
+                elif isinstance(evt, GenerationSummary):
+                    _write_sse(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req_model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": evt.finish_reason,
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": evt.prompt_tokens,
+                                "completion_tokens": evt.completion_tokens,
+                                "total_tokens": evt.total_tokens,
+                            },
+                            "tpuforge_telemetry": asdict(evt),
+                        }
+                    )
 
             try:
                 _write_sse(
@@ -1441,52 +1828,20 @@ class _ForgeServeHandler(BaseHTTPRequestHandler):
                         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                     }
                 )
-                pending: list[StepPulse | GenerationSummary] = [first_or_summary]
-                pending.extend(gen_iter)
-                for evt in pending:
-                    if isinstance(evt, StepPulse):
-                        chunk_payload: dict[str, Any] = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": req_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": (
-                                        {"content": evt.text_delta} if evt.text_delta else {}
-                                    ),
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        if evt.drafted_nodes > 0 or evt.accepted_rows:
-                            chunk_payload["tpuforge_step"] = asdict(evt)
-                        _write_sse(chunk_payload)
-                    elif isinstance(evt, GenerationSummary):
-                        _write_sse(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": req_model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {},
-                                        "finish_reason": evt.finish_reason,
-                                    }
-                                ],
-                                "usage": {
-                                    "prompt_tokens": evt.prompt_tokens,
-                                    "completion_tokens": evt.completion_tokens,
-                                    "total_tokens": evt.total_tokens,
-                                },
-                                "tpuforge_telemetry": asdict(evt),
-                            }
-                        )
+                _emit_sse_item(first_or_summary)
+                for evt in gen_iter:
+                    _emit_sse_item(evt)
                 _write_sse("[DONE]")
-            except (BrokenPipeError, ConnectionResetError):
+            except _CLIENT_DISCONNECT_ERRORS:
+                self.close_connection = True
+                return
+            except (RuntimeError, LookupError, ArithmeticError, ValueError) as exc:
+                try:
+                    _write_sse({"error": {"message": str(exc), "type": "server_error"}})
+                    _write_sse("[DONE]")
+                except _CLIENT_DISCONNECT_ERRORS:
+                    pass
+                self.close_connection = True
                 return
             self.close_connection = True
             return
@@ -1504,7 +1859,7 @@ def start_serve_background(
     server = ForgeServeHTTPServer((host, int(port)), session)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://{host}:{server.server_port}"
+    url = f"http://{host}:{server.bound_port}"
     return server, thread, url
 
 
@@ -1526,7 +1881,7 @@ def launch_colab_hud(
     try:
         from google.colab import output  # type: ignore[import-not-found]
 
-        output.serve_kernel_port_as_iframe(server.server_port, height=height)
+        output.serve_kernel_port_as_iframe(server.bound_port, height=height)
     except ImportError:
         pass
     print(f"TPUForge Serve Live Systolic HUD ready at: {url}")
@@ -1550,6 +1905,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="List all presets with automatic TPU hardware fit detection and exit.",
     )
+    parser.add_argument(
+        "--list-local",
+        action="store_true",
+        help="Scan local cache roots for complete safetensors checkpoints and exit.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve preset and hardware placement plan as JSON and exit without loading weights.",
+    )
+    dl_group = parser.add_mutually_exclusive_group()
+    dl_group.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Require target and draft checkpoints to already exist locally; never download from HF Hub.",
+    )
+    dl_group.add_argument(
+        "--allow-download",
+        action="store_true",
+        help="Allow falling back to Hugging Face Hub download when a model is absent locally.",
+    )
     parser.add_argument("--draft-model", default=None, help="Override DFlash draft model repo/path.")
     parser.add_argument("--max-seq-len", type=int, default=None, help="Static KV arena sequence length.")
     parser.add_argument("--dtype", default=None, choices=["auto", "float32", "bfloat16", "float16"])
@@ -1566,8 +1942,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    if args.port < 0 or args.port > 65535:
+        parser.error("--port must be between 0 and 65535")
+    if args.stage_experts < 1:
+        parser.error("--stage-experts must be >= 1")
+    if args.top_k < 1:
+        parser.error("--top-k must be >= 1")
+    tp_clean = str(args.tp_size).strip().lower()
+    if tp_clean != "auto":
+        try:
+            tp_val = int(tp_clean)
+        except ValueError:
+            parser.error("--tp-size must be 'auto' or a positive integer")
+        if tp_val < 1:
+            parser.error("--tp-size must be >= 1")
+
     if args.list_presets:
         print(format_preset_catalog_table())
+        return 0
+    if args.list_local:
+        print(format_local_models_table())
+        return 0
+
+    try:
+        spec = resolve_preset_spec(
+            args.target,
+            draft_model=args.draft_model,
+            weight_quant=args.weight_quant,
+            dtype=args.dtype,
+            host_store=args.host_store,
+            tile_size=args.tile_size,
+            tp_size=args.tp_size,
+            max_seq_len=args.max_seq_len,
+            top_k=args.top_k,
+            stage_experts=args.stage_experts,
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+
+    allow_download = not args.local_only
+    if args.dry_run:
+        payload = asdict(spec)
+        payload["allow_download"] = allow_download
+        print(json.dumps(payload, indent=2))
         return 0
 
     session = load_serve_session(
@@ -1583,10 +2000,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         top_k=args.top_k,
         ast_seed_path=args.ast_seed_path,
         enable_xla_cache=not args.no_xla_cache,
+        allow_download=allow_download,
         warmup=not args.no_warmup,
     )
     server = ForgeServeHTTPServer((args.host, args.port), session)
-    url = f"http://{args.host}:{server.server_port}"
+    url = f"http://{args.host}:{server.bound_port}"
     print(f"TPUForge Serve running on {url}")
     print(f"  Preset      : {session.spec.preset_name} ({session.spec.model_id})")
     print(f"  Hardware    : {session.spec.hardware.label}")
