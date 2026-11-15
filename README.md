@@ -15,7 +15,7 @@
 
 Most LLM serving stacks were built around GPU warps, asynchronous CUDA streams, and dynamic-shape runtime graphs. On Google Cloud TPUs, standard batch-1 token decode leaves `127` of `128` rows idle on a `v5e` Matrix Multiply Unit (`255` of `256` on `v6e` Trillium and `v7`), while unaligned prompt shapes stall behind multi-second XLA recompilations.
 
-**TPUForge** aligns static HBM allocation, `128`/`256`-row systolic tree verification, native `INT8`/`FP8` quantized `dot_general`, host-`mmap` MoE streaming, and optical torus Ring-Attention directly to TPU silicon geometry. Its primary model runtime natively targets late-2026 **Google Gemma 4** (`Apache 2.0`, ungated: `26B-A4B-it` MoE, `12B-it`, and `31B-it` with matching `DFlash` block-diffusion drafters), alongside a secondary `Qwen3-4B` cross-architecture check and verified live Cloud TPU `v5e-1` silicon baselines (`202.80 tok/s` / `4.12x` decode on `Qwen2.5-Coder-7B-Instruct`, `328.79 tok/s` / `3.47x` decode on `3B`).
+**TPUForge** aligns static HBM allocation, `128`/`256`-row systolic tree verification, native `INT8`/`FP8` quantized `dot_general`, host-`mmap` MoE streaming, and optical torus Ring-Attention directly to TPU silicon geometry. Evaluated live on Cloud TPU `v6e-1` Trillium (`31.24 GiB` HBM, `256x256` MXU) with late-2026 **Google Gemma 4** (`Apache 2.0`, ungated), TPUForge hits **`167.54 tok/s`** (`30.30x` over Vanilla JAX / `12.17x` over Static Arena, `128/128` exact parity) on `google/gemma-4-26B-A4B-it` Sparse MoE (`INT8` single-chip HBM), **`328.97 tok/s`** (`12.07x` over Vanilla `INT8`, `18.00x` over `BF16`) on `google/gemma-4-12B-it` `INT8`, **`186.95 tok/s`** on `12B BF16`, and **`900.55 tok/s`** on `Qwen3-4B`, alongside verified Cloud TPU `v5e-1` baselines (`202.80 tok/s` on `Qwen2.5-Coder-7B`, `328.79 tok/s` on `3B`).
 
 ---
 
@@ -42,7 +42,7 @@ pytest -q
 ## Contents
 
 - [1. Target Lineup: Google Gemma 4 on Cloud TPUs](#1-target-lineup-google-gemma-4-on-cloud-tpus)
-- [2. Verified Cloud TPU Silicon Baseline (`v5e-1`)](#2-verified-cloud-tpu-silicon-baseline-v5e-1)
+- [2. Verified Cloud TPU Silicon Telemetry (`v6e-1` Trillium & `v5e-1`)](#2-verified-cloud-tpu-silicon-telemetry-v6e-1-trillium--v5e-1)
 - [3. Cold-Prompt Drafting, Quantization, & MoE Extensions (`M-006`..`M-008`)](#3-cold-prompt-drafting-quantization--moe-extensions-m-006m-008)
 - [4. Architecture and Subsystem Design](#4-architecture-and-subsystem-design)
 - [5. Command Reference and Hardware Matrix](#5-command-reference-and-hardware-matrix)
@@ -59,10 +59,10 @@ All flagship runs use ungated `Apache 2.0` Google Gemma 4 weights implemented na
 
 | Target Pair | Role & Architecture | Weight Footprint | Primary TPU Mapping & Hardware Physics | Cloud TPU Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **`google/gemma-4-26B-A4B-it`** + `z-lab/gemma-4-26B-A4B-it-DFlash` | **Flagship Sparse MoE** (`128` experts, top-`8`, `4B` active) | `48.07 GiB` `BF16` -> **`25.08 GiB` total** at `INT8` (`0.80 GiB` DFlash) | Fits 100% inside `32 GiB` `v6e-1` HBM (`INT8`), runs `TP=8` on `v5e-8`, or streams via host `mmap` on `15.75 GiB` `v5e-1` (`3.81 GiB` HBM trunk + static KV). | Staged on `v5e-8` / `v6e-1` (Pending silicon JSON) |
-| **`google/gemma-4-12B-it`** + `z-lab/gemma4-12B-it-DFlash` | **Single-Chip Dense** (`48` layers, `5` sliding : `1` full) | `22.28 GiB` `BF16` -> **`13.97 GiB` total** (`13.29` + `~0.68 GiB` DFlash `INT8`) | Fits together inside `15.75 GiB` `v5e-1` HBM via native `INT8` systolic `dot_general`; runs both `BF16` and `INT8` on `32 GiB` `v6e-1`. | Staged on `v5e` / `v6e` (Pending silicon JSON) |
-| **`google/gemma-4-31B-it`** + `z-lab/gemma-4-31B-it-DFlash` | **Multi-Chip Flagship Dense** (`TP=8` Megatron GSPMD) | `58.25 GiB` `BF16` (`2.86 GiB` DFlash) -> **`9.80 GiB/chip` at `TP=8`** | Reuses tied `embed_tokens` directly as `lm_head` (`transpose_lm_head=True`), avoiding a duplicate `2.62 GiB` projection across `v5e-8`. | Staged on `v5e-8` (Pending silicon JSON) |
-| **`Qwen/Qwen3-4B`** + `z-lab/Qwen3-4B-DFlash-b16` | **Secondary Cross-Arch Check** (`4B` dense) | `~7.5 GiB` `BF16` | Cross-architecture verification alongside `M-005` Optical Torus Ring-Attention. | Staged on `v5e` / `v6e` |
+| **`google/gemma-4-26B-A4B-it`** + `z-lab/gemma-4-26B-A4B-it-DFlash` | **Flagship Sparse MoE** (`128` experts, top-`8`, `4B` active) | `48.07 GiB` `BF16` -> **`24.95 GiB`** target HBM at `INT8` | Fits 100% inside `31.24 GiB` `v6e-1` HBM (`INT8`), runs `TP=8` on `v5e-8`, or streams via host `mmap` on `15.75 GiB` `v5e-1` (`3.81 GiB` HBM trunk + static KV). | **Verified `v6e-1` Silicon** (`167.54 tok/s`, `30.30x` vs Vanilla / `12.17x` vs Static) |
+| **`google/gemma-4-12B-it`** + `z-lab/gemma4-12B-it-DFlash` | **Single-Chip Dense** (`48` layers, `5` sliding : `1` full) | **`22.18 GiB`** `BF16` -> **`12.97 GiB`** target `INT8` (`0.585x`) | Fits inside `15.75 GiB` `v5e-1` HBM via native `INT8` systolic `dot_general`; benchmarks both `BF16` and `INT8` on `31.24 GiB` `v6e-1`. | **Verified `v6e-1` Silicon** (`328.97 tok/s` `INT8`, `186.95 tok/s` `BF16`) |
+| **`google/gemma-4-31B-it`** + `z-lab/gemma-4-31B-it-DFlash` | **Multi-Chip Flagship Dense** (`TP=8` Megatron GSPMD) | `58.25 GiB` `BF16` (`2.86 GiB` DFlash) -> **`9.80 GiB/chip` at `TP=8`** | Reuses tied `embed_tokens` directly as `lm_head` (`transpose_lm_head=True`), avoiding a duplicate `2.62 GiB` projection across `v5e-8`. | Queued on Kaggle `v5e-8` (Multi-chip `TP=8`) |
+| **`Qwen/Qwen3-4B`** + `z-lab/Qwen3-4B-DFlash-b16` | **Secondary Cross-Arch Check** (`4B` dense) | **`8.22 GiB`** `BF16` | Cross-architecture verification alongside `M-005` Optical Torus Ring-Attention. | **Verified `v6e-1` Silicon** (`900.55 tok/s`, `11.64` tok/pass) |
 
 ### Why Gemma 4 Amplifies TPUForge's Kernel Design
 
@@ -72,14 +72,46 @@ All flagship runs use ungated `Apache 2.0` Google Gemma 4 weights implemented na
 
 ---
 
-## 2. Verified Cloud TPU Silicon Baseline (`v5e-1`)
+## 2. Verified Cloud TPU Silicon Telemetry (`v6e-1` Trillium & `v5e-1`)
 
 <!-- SLIDE_04: assets/slides/slide_04.png -->
 <!-- SLIDE_05: assets/slides/slide_05.png -->
 
-All live silicon numbers currently reported here were measured on Google Cloud TPU `v5e-1` (`TPU v5 lite`, `15.75 GiB` HBM, `JAX 0.11.2`, `bfloat16`) using on-device `jnp.argmax` (`verify_greedy_tokens`) and zero-constant-capture `_weights_tuple` lowering on `Qwen2.5-Coder` (`M-002`..`M-005`). Every speculative run matched Vanilla JAX greedy output **token for token (`100%`)**. Live Gemma 4 Cloud TPU runs are staged and will populate a separate silicon table once executed.
+### Cloud TPU `v6e-1` Trillium (`TPU v6 lite`, `31.24 GiB` HBM, `tile=256`, `JAX 0.11.2`)
 
-### Autoregressive Decode & Zero-Recompilation Sweep (`Qwen2.5-Coder` `v5e-1` Baseline)
+Measured live on Google Cloud TPU `v6e-1` via [`benchmarks/gemma4_jax.py`](benchmarks/gemma4_jax.py), [`benchmarks/quantization_jax.py`](benchmarks/quantization_jax.py), [`benchmarks/block_diffusion_jax.py`](benchmarks/block_diffusion_jax.py), and [`benchmarks/ast_seed_jax.py`](benchmarks/ast_seed_jax.py) (archived in [`benchmarks/results/colab_gemma4_results.json`](benchmarks/results/colab_gemma4_results.json)):
+
+| Model & Precision (`v6e-1`, `tile=256`) | Workload (`gen=128`, `114` on Qwen3 Codegen) | Vanilla JAX (tok/s) | Static Arena (tok/s) | TPUForge Tree (tok/s) | Block-Tree (tok/s) | Tok / Pass | Speedup (vs Static / vs Vanilla Dec / Total) | Exact Parity vs Vanilla |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`Gemma 4 26B-A4B MoE`** (`INT8`, `24.95 GiB`) | Code Refactor (`P=285`) | `5.53` | `13.77` | `64.64` | **`167.54`** | `12.80` | **`12.17x`** / **`30.30x`** / **`32.78x`** | **`128 / 128`** |
+| **`Gemma 4 26B-A4B MoE`** (`INT8`, `24.95 GiB`) | Cold Codegen + AST (`P=63`, `78K` AST) | `5.53` | | `20.52` | **`125.83`** | `9.85` | **`9.14x`*** / **`22.76x`** / **`25.80x`** | **`128 / 128`** |
+| **`Gemma 4 26B-A4B MoE`** (`INT8`, `24.95 GiB`) | Cold Chat (`P=51`, `0` AST) | `5.52` | | `15.85` | **`36.53`** | `2.78` | **`2.65x`*** / **`6.62x`** / **`7.89x`** | `46/128` Tree prefix (`BF16` tie) |
+| **`Gemma 4 12B Dense`** (`INT8`, `12.97 GiB`) | Code Refactor (`P=285`) | `27.26` | `28.73` | `134.69` | **`328.97`** | `12.80` | **`11.45x`** / **`12.07x`** / **`31.23x`** | **`128 / 128`** |
+| **`Gemma 4 12B Dense`** (`INT8`, `12.97 GiB`) | Cold Codegen + AST (`P=63`, `78K` AST) | `27.21` | | `43.12` | **`244.28`** | `9.85` | **`8.50x`*** / **`8.98x`** / **`24.54x`** | **`128 / 128`** |
+| **`Gemma 4 12B Dense`** (`INT8`, `12.97 GiB`) | Cold Chat (`P=51`, `0` AST) | `27.24` | | `33.88` | **`92.61`** | `3.56` | **`3.22x`*** / **`3.40x`** / **`9.72x`** | `Tree == Block-Tree` `100%` |
+| **`Gemma 4 12B Dense`** (`BF16`, `22.18 GiB`) | Code Refactor (`P=285`) | `18.28` | `17.54` | `82.50` | **`186.95`** | `11.64` | **`10.66x`** / **`10.23x`** / **`20.63x`** | **`128 / 128`** |
+| **`Gemma 4 12B Dense`** (`BF16`, `22.18 GiB`) | Cold Codegen + AST (`P=63`, `78K` AST) | `18.25` | | `26.46` | **`154.19`** | `9.85` | **`8.79x`*** / **`8.45x`** / **`18.10x`** | **`128 / 128`** |
+| **`Gemma 4 12B Dense`** (`BF16`, `22.18 GiB`) | Cold Chat (`P=51`, `0` AST) | `18.26` | | `20.66` | **`57.30`** | `3.56` | **`3.27x`*** / **`3.14x`** / **`7.02x`** | `Tree == Block-Tree` `100%` |
+| **`Qwen3-4B`** (`BF16`, `8.22 GiB`) | Code Refactor (`P=223`) | `127.49` | `104.09` | `386.12` | **`900.55`** | `11.64` | **`8.65x`** / **`7.06x`** / **`15.48x`** | **`128 / 128`** |
+| **`Qwen3-4B`** (`BF16`, `8.22 GiB`) | Cold Codegen + AST (`P=59`, `63K` AST) | `126.48` | | `141.57` | **`764.05`** | `11.40` | **`7.34x`*** / **`6.04x`** / **`10.16x`** | **`114 / 114`** |
+| **`Qwen3-4B`** (`BF16`, `8.22 GiB`) | Cold Chat (`P=54`, `0` AST) | `126.50` | | `128.02` | **`242.77`** | `3.13` | **`2.33x`*** / **`1.92x`** / **`3.32x`** | `114 / 121` prefix match |
+
+*\*Compared against the measured single-token Static Arena decode rate on the same model and precision.*
+
+| `v6e-1` Zero-Recompile Prompt Sweep (`4` Unaligned Lengths) | Vanilla Compiles | Static Arena Compiles | Full Sweep Time | Speedup |
+| :--- | :---: | :---: | :---: | :---: |
+| **`Gemma 4 26B-A4B MoE`** (`INT8`, `[38, 70, 104, 224]`) | `5` | **`1`** | `13.27s` vs `26.94s` | **`2.03x`** |
+| **`Gemma 4 12B Dense`** (`BF16`, `[38, 70, 104, 224]`) | `5` | **`1`** | `12.05s` vs `39.38s` | **`3.27x`** |
+| **`Gemma 4 12B Dense`** (`INT8`, `[38, 70, 104, 224]`) | `5` | **`1`** | `4.46s` vs `39.30s` | **`8.80x`** |
+| **`Qwen3-4B`** (`BF16`, `[36, 68, 99, 199]`) | `5` | **`1`** | `1.67s` vs `4.51s` | **`2.71x`** |
+
+* **Native `INT8` Mixed-Precision Proof (`M-007` on `Gemma 4 12B`):** Symmetrically quantizing `12B` weights from `22.18 GiB` (`BF16`) to `12.97 GiB` (`INT8`, `0.585x`) saves `9.20 GiB` HBM (fitting inside a single `15.75 GiB` `v5e-1` chip as well) while speeding up `Static Arena` single-token decode **`1.64x`** (`28.73` vs `17.54 tok/s`) and lifting `Block-Tree` code refactor throughput to **`328.97 tok/s`** (**`18.00x`** over `BF16` Vanilla JAX).
+* **Open-Ended Prose Numerics Note:** On open-ended `Cold Chat`, `[1, D]` unpadded Vanilla JAX matmuls and `[256, D]` systolic MXU tiled matmuls break near-tie `BF16` logits (`1 ULP`) differently at token `2` on `12B` (`46/128` prefix on `26B-A4B`, `114/121` on `Qwen3-4B`). Across all fixed-tile `[256, D]` modes on `12B`, `tpuforge_tree == tpuforge_block_tree` remains **100% exact**, and every `Code Refactor` and `Cold Codegen` workload matches Vanilla JAX token for token (`128/128` / `114/114`).
+* **`M-005` Optical Torus Flash-Ring Attention (`28,672 / 32,768` ctx, `1.75 GiB` KV, `ring=1, TP=1`):** On `v6e-1` (`tile=256`), Flash-Ring reaches **`638,908 tok/s`** prefill (`44.88 ms`, `1.23x` faster than `v5e-1`) and **`1.116 ms`** per `256`-node systolic tree step (**`229,305` tree-nodes/s**, `1.85x` `v5e-1` node throughput, `collective-permute` HLO verified).
+
+### Preliminary Cloud TPU `v5e-1` Baseline (`Qwen2.5-Coder`, `15.75 GiB` HBM, `tile=128`, `BF16`)
+
+All Phase 1 silicon numbers below were measured on Cloud TPU `v5e-1` (`TPU v5 lite`, `JAX 0.11.2`, `bfloat16`) using on-device `jnp.argmax` (`verify_greedy_tokens`) on `Qwen2.5-Coder` (`M-002`..`M-005`), matching Vanilla JAX greedy output **token for token (`100%`)**:
 
 | Model (`v5e-1`, `BF16`) | Workload | Vanilla JAX (tok/s) | Static Arena (tok/s) | TPUForge Tree (tok/s) | Tokens / Pass | Decode Speedup | Total Speedup | Exact Match |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -94,8 +126,8 @@ All live silicon numbers currently reported here were measured on Google Cloud T
 | **`Qwen2.5-Coder-7B-Instruct`** (`v5e-1`) | `5` | **`1`** | `1.633s` vs `3.869s` (`2.37x`) | `0.347s` vs `2.679s` | **`7.72x`** |
 
 * **Eliminating Host Logits Stalls (`M-003`):** Moving `jnp.argmax` onto HBM removed `~78 MB` (`tile=128`) and `~156 MB` (`tile=256`) PCIe transfers on `Qwen2.5-Coder`, shrinking a full `128`-node verification pass to `11.80 ms` vs `10.62 ms` per `1`-token Vanilla step on `3B` (`22.54 ms` vs `20.63 ms` on `7B`). That gained `3.38x` over pre-argmax `97.22 tok/s` (`3B`) and `1.76x` over `115.27 tok/s` (`7B`).
-* **Hardware-Matched MXU Tile Width (`infer_mxu_dim`):** On `v5e-1` (`128x128` physical MXU), `tile=128` (`328.79 tok/s`, `11.80 ms/pass`) beats `tile=256` (`268.39 tok/s`, `14.45 ms/pass`) by **`1.23x`** while `tile=256` targets `256x256` MXUs on `v6e` Trillium and `v7`.
-* **Blockwise Flash-Ring Attention (`M-005`, `ring=1`, `TP=1`, `BF16`):** Reached **`2,680,640 tok/s`** prefill (`1.337 ms`) and **`0.353 ms`** tree step (`362,752` tree-nodes/s; `3.91e-03` prefill / `1.22e-04` tree `BF16` max abs error) at `3584 / 4096`, plus **`519,735 tok/s`** prefill (`55.167 ms`) and **`1.032 ms`** tree step (`124,047` tree-nodes/s, `1.75 GiB` KV, `collective-permute` HLO verified) at `28672 / 32768`.
+* **Hardware-Matched MXU Tile Width (`infer_mxu_dim`):** On `v5e-1` (`128x128` physical MXU), `tile=128` (`328.79 tok/s`, `11.80 ms/pass`) beats `tile=256` (`268.39 tok/s`, `14.45 ms/pass`) by **`1.23x`** while `tile=256` matches `256x256` MXUs on `v6e-1` Trillium and `v7`.
+* **`v5e-1` Blockwise Flash-Ring Attention (`M-005`, `ring=1`, `TP=1`, `BF16`):** Reached **`2,680,640 tok/s`** prefill (`1.337 ms`) and **`0.353 ms`** tree step (`362,752` tree-nodes/s; `3.91e-03` prefill / `1.22e-04` tree `BF16` max abs error) at `3584 / 4096`, plus **`519,735 tok/s`** prefill (`55.167 ms`) and **`1.032 ms`** tree step (`124,047` tree-nodes/s, `1.75 GiB` KV, `collective-permute` HLO verified) at `28672 / 32768`.
 
 ---
 
@@ -108,12 +140,12 @@ Context-only suffix drafting drops to **`1.27x` (`7B`)** and **`1.26x` (`3B`)** 
 
 | Extension | Implemented Mechanism | Offline Verification Status (`55/55` pytest) | Cloud TPU Status |
 | :--- | :--- | :--- | :--- |
-| **`M-006`: Hybrid Block-Diffusion Tree** (`tpuforge_block_tree`) | `Gemma4BlockTreeRunner` (`benchmarks/gemma4_jax.py`) + `QwenBlockTreeRunner` (`benchmarks/block_diffusion_jax.py`) fuse parallel `DFlash` block-drafter `top-k` predictions with `O(1)` `SuffixIndex` continuations via `TreeBuilder::build_from_block_top_k`. | Verified (`test_block_tree_and_suffix.py` & `test_gemma4.py`): sub-`15 ms` tree packing at `32K+`, 4-mode parity, `transpose_lm_head` tied reuse, `TP=2` HLO green. | Staged on `v5e` / `v6e` |
-| **`M-009`: Out-of-Band Repository AST Seeding** | `benchmarks/ast_seed_jax.py`, `SuffixIndex::seed_sequences`, `ForgeEngine::seed_ast_text`, `--ast-seed-path`, and HTTP `"seed_snippets"` pre-warm cold codegen drafting at zero prompt/KV cost. | Verified (`test_ast_seed_drafter.py`): Python/C++ AST extraction, exact greedy parity, 1-token fallback. | Staged on `v5e` / `v6e` |
-| **`M-007`: Native `INT8` / `FP8` Systolic Kernels** | `benchmarks/quantization_jax.py` computes pre-sharding symmetric per-channel `int8` / `float8_e4m3fn` weights and scales (`>=2D` N-D periodic scan specs) executed via constant-free `jax.lax.dot_general`. | Verified (`test_quantized_systolic.py` & `test_gemma4.py`): `< 0.65x` linear HBM footprint vs `BF16`, Gemma 4 `INT8`/`FP8` 4-mode parity, `TP=2` `all-reduce` HLO. | Staged on `v5e` / `v6e` |
-| **`M-008`: Host `mmap` Sparse MoE Streaming** | `benchmarks/moe_streaming_jax.py` + `Gemma4MoeStreamRunner` pin attention, routers, and KV caches in HBM while `ExpertHostStore` streams routed `3D` stacked or `2D` experts from `mmap` into `E_stage` slots amortized across `128` tree nodes. | Verified (`test_moe_streaming.py` & `test_gemma4.py`): `< 30%` Gemma 4 HBM trunk ratio (`< 45%` OLMoE), `0` steady-state recompiles, Windows `mmap` release verified. | Staged on `v5e` / `v6e` |
+| **`M-006`: Hybrid Block-Diffusion Tree** (`tpuforge_block_tree`) | `Gemma4BlockTreeRunner` (`benchmarks/gemma4_jax.py`) + `QwenBlockTreeRunner` (`benchmarks/block_diffusion_jax.py`) fuse parallel `DFlash` block-drafter `top-k` predictions with `O(1)` `SuffixIndex` continuations via `TreeBuilder::build_from_block_top_k`. | Verified (`test_block_tree_and_suffix.py` & `test_gemma4.py`): sub-`15 ms` tree packing at `32K+`, 4-mode parity, `transpose_lm_head` tied reuse, `TP=2` HLO green. | **Verified `v6e-1` Silicon**: `328.97 tok/s` (`12B INT8`), `167.54 tok/s` (`26B-A4B INT8`), `900.55 tok/s` (`Qwen3-4B`) |
+| **`M-009`: Out-of-Band Repository AST Seeding** | `benchmarks/ast_seed_jax.py`, `SuffixIndex::seed_sequences`, `ForgeEngine::seed_ast_text`, `--ast-seed-path`, and HTTP `"seed_snippets"` pre-warm cold codegen drafting at zero prompt/KV cost. | Verified (`test_ast_seed_drafter.py`): Python/C++ AST extraction, exact greedy parity, 1-token fallback. | **Verified `v6e-1` Silicon** (`78,096` AST tokens): `244.28 tok/s` (`12B INT8`), `125.83 tok/s` (`26B-A4B`), `764.05 tok/s` (`Qwen3-4B`) |
+| **`M-007`: Native `INT8` / `FP8` Systolic Kernels** | `benchmarks/quantization_jax.py` computes pre-sharding symmetric per-channel `int8` / `float8_e4m3fn` weights and scales (`>=2D` N-D periodic scan specs) executed via constant-free `jax.lax.dot_general`. | Verified (`test_quantized_systolic.py` & `test_gemma4.py`): `< 0.65x` linear HBM footprint vs `BF16`, Gemma 4 `INT8`/`FP8` 4-mode parity, `TP=2` `all-reduce` HLO. | **Verified `v6e-1` Silicon**: `12.97 GiB` vs `22.18 GiB` `12B` (`0.585x`), `24.95 GiB` `26B-A4B`, `1.64x` Static decode |
+| **`M-008`: Host `mmap` Sparse MoE Streaming** | `benchmarks/moe_streaming_jax.py` + `Gemma4MoeStreamRunner` pin attention, routers, and KV caches in HBM while `ExpertHostStore` streams routed `3D` stacked or `2D` experts from `mmap` into `E_stage` slots amortized across `128` tree nodes. | Verified (`test_moe_streaming.py` & `test_gemma4.py`): `< 30%` Gemma 4 HBM trunk ratio (`< 45%` OLMoE), `0` steady-state recompiles, Windows `mmap` release verified. | Verified offline (`55/55` pytest); staged for `15.75 GiB` `v5e-1` (`26B-A4B INT8` fit 100% in `v6e-1` HBM) |
 
-*(No simulated Cloud TPU numbers are reported anywhere for Phase 2 or Gemma 4 until live silicon JSON outputs complete.)*
+*(Multi-chip `v5e-8` `TP=8` runs and `M-008` `v5e-1` host `mmap` streaming remain labeled honestly above until their own Cloud TPU JSON telemetry completes.)*
 
 ---
 
@@ -186,7 +218,7 @@ python -m benchmarks.package_kaggle_bundle
 | :--- | :--- | :--- |
 | **Local CPU (PJRT CPU)** | Verified (`55/55` pytest) | `128`/`256` tile simulation, Gemma 4 periodic `5:1` scan + `3D` MoE + `DFlash` + `INT8`/`FP8` + `mmap` + `TP=2`, `O(1)` `SuffixIndex` + AST seeding, OpenXLA GSPMD TP parity |
 | **Cloud TPU `v5e-1` (`15.75 GiB` HBM)** | Verified Silicon (`Qwen2.5`) / Staged (`Gemma 4`) | Verified: `32K` Flash-Ring (`519,735 tok/s`), `3B` (`328.79 tok/s`), `7B` (`202.80 tok/s`), `tile=128` vs `256` (`1.23x`). Staged: Gemma 4 `12B INT8` (`13.97 GiB`), `26B-A4B mmap INT8`, `Qwen3-4B` check |
-| **Cloud TPU `v6e-1` (`32 GiB` HBM, Trillium)** | Ready / Staged | `256x256` MXU auto-inferred via `infer_mxu_dim`; `26B-A4B INT8 + DFlash` (`25.08 GiB` total) and `12B BF16/INT8 + DFlash` fit 100% inside single-chip HBM |
+| **Cloud TPU `v6e-1` (`31.24 GiB` HBM, Trillium)** | **Verified Silicon (`Gemma 4` + `Qwen3-4B`)** | `tile=256`: `Gemma 4 26B-A4B INT8` (`24.95 GiB`, `167.54 tok/s`, `30.30x` vs Vanilla), `12B INT8` (`12.97 GiB`, `328.97 tok/s`), `12B BF16` (`22.18 GiB`, `186.95 tok/s`), `Qwen3-4B` (`900.55 tok/s`), `M-005` (`638,908 tok/s` prefill, `229,305` tree-nodes/s) |
 | **Kaggle Free TPU `v5e-8` (`128 GiB` HBM)** | Queued / Staged | `8x16 GiB` pooled HBM: `128K` ICI Ring-Attention (`M-005`), Gemma 4 `26B-A4B` `TP=8`, `31B` `TP=8` (`9.80 GiB/chip` tied `BF16`), and `12B` tile sweep |
 
 * `include/`: Public C/C++ engine headers (`pjrt_c_api.h`, `kv_cache.h`, `tree_speculator.h`, `openai_server.h`, `engine.h`).
