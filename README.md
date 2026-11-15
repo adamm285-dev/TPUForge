@@ -82,6 +82,10 @@ All flagship runs use ungated `Apache 2.0` Google Gemma 4 weights implemented na
 ## 2. Verified Cloud TPU Silicon Telemetry (`v6e-1` Trillium & `v5e-1`)
 
 <p align="center">
+  <a href="assets/slides/gemma4_v6e_benchmark_chart.png"><img src="assets/slides/gemma4_v6e_benchmark_chart.png" width="100%" alt="Google Gemma 4 on Cloud TPU v6e-1 Trillium: Decode Throughput (tok/s)"></a>
+</p>
+
+<p align="center">
   <a href="assets/slides/slide_04.png"><img src="assets/slides/slide_04.png" width="49%" alt="Live Cloud TPU v6e Trillium Telemetry"></a>
   <a href="assets/slides/slide_05.png"><img src="assets/slides/slide_05.png" width="49%" alt="Zero-Recompilation via StaticArena"></a>
 </p>
@@ -239,7 +243,7 @@ python -m benchmarks.package_kaggle_bundle
 * `benchmarks/`: OpenXLA/JAX modules (`gemma4_jax.py`, `qwen_jax.py`, `quantization_jax.py`, `moe_streaming_jax.py`, `ast_seed_jax.py`, `block_diffusion_jax.py`, `ring_attention_jax.py`, `run_qwen_bench.py`, `package_kaggle_bundle.py`).
 * `tests/`: `55` offline unit, C++/nanobind, XLA sharding, Gemma 4, quantized systolic, sparse MoE streaming, AST-seeding, block-tree, and ring-attention tests (`pytest`).
 * `docs/`: Architecture and TRC proposal notes ([`docs/TRC_APPLICATION.md`](docs/TRC_APPLICATION.md)).
-* `assets/slides/`: Dark-mode architectural and Cloud TPU `v6e-1` Trillium telemetry slide deck (`slide_01.png`..`slide_08.png`).
+* `assets/slides/`: Dark-mode architectural slide deck (`slide_01.png`..`slide_08.png`) and Gemma 4 `v6e-1` Trillium benchmark chart (`gemma4_v6e_benchmark_chart.png`).
 * `assets/audio/`: Systems engineering audio overview (`TPUForge_Audio_Overview.m4a`, `6:16`).
 
 ---
